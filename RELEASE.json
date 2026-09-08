@@ -1,0 +1,34 @@
+{
+  "release": "m365-gateway-public-source-2026-09-05",
+  "createdAt": "2026-09-05T15:08:53.810Z",
+  "sourceOfTruth": "Sanitized local canonical source; not a downloaded production bundle",
+  "sourceStatus": "sanitized_local_source",
+  "validation": {
+    "canonicalCheck": {
+      "status": "passed",
+      "testFiles": 17,
+      "tests": 358,
+      "logSha256": "e130959c6a90a9048d7f396b6ff8bfc1a33d50141c4b3724bb0430421a287709"
+    },
+    "stageCheck": {
+      "status": "passed",
+      "testFiles": 17,
+      "tests": 358,
+      "logSha256": "384ab344bc9d69440ed9f376acf940c15d6801cbec0ba6b7b0b762927cb52832"
+    },
+    "vision": "not_live_verified"
+  },
+  "deployment": {
+    "status": "not_deployed",
+    "note": "This archive does not assert a production deployment or live Microsoft 365 vision acceptance."
+  },
+  "license": {
+    "status": "not_declared",
+    "note": "No open-source license grant is supplied by this package; licensing remains to be confirmed."
+  },
+  "integrity": {
+    "algorithm": "SHA-256",
+    "manifest": "SHA256SUMS",
+    "scope": "Every archive file except SHA256SUMS itself; the archive hash is returned separately."
+  }
+}
