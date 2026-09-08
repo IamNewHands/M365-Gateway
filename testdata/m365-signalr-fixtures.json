@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "record_separator": "\u001e",
+  "cases": [
+    {
+      "id": "type3_without_type2_text_success",
+      "handshake": ["{}"],
+      "frames": [
+        {"type": 1, "target": "update", "arguments": [{"throttling": {"CostQuota": 0}}]},
+        {"type": 1, "target": "update", "arguments": [{"writeAtCursor": "long "}]},
+        {"type": 6},
+        {"type": 1, "target": "update", "arguments": [{"writeAtCursor": "answer", "isLastUpdate": true}]},
+        {"type": 3}
+      ],
+      "expect": {"outcome": "success", "text": "long answer", "invocation_submitted": true}
+    },
+    {
+      "id": "type2_then_type3_final_message",
+      "handshake": ["{}"],
+      "frames": [
+        {"type": 2, "item": {"result": {"message": "final answer", "value": "{}"}, "throttling": {"CostQuota": 1}}},
+        {"type": 3}
+      ],
+      "expect": {"outcome": "success", "text": "final answer", "invocation_submitted": true}
+    },
+    {
+      "id": "coalesced_handshake_and_first_update",
+      "handshake": [
+        "{}",
+        {"type": 1, "target": "update", "arguments": [{"writeAtCursor": "first "}]}
+      ],
+      "frames": [
+        {"type": 1, "target": "update", "arguments": [{"writeAtCursor": "frame"}]},
+        {"type": 3}
+      ],
+      "expect": {"outcome": "success", "text": "first frame", "invocation_submitted": true}
+    },
+    {
+      "id": "content_wins_over_zero_quota",
+      "handshake": ["{}"],
+      "frames": [
+        {"type": 1, "target": "update", "arguments": [{"throttling": {"metering": {"CostQuota": {"remainingAllowance": 0}}}, "writeAtCursor": "usable"}]},
+        {"type": 3}
+      ],
+      "expect": {"outcome": "success", "text": "usable", "invocation_submitted": true}
+    },
+    {
+      "id": "empty_terminal_quota",
+      "handshake": ["{}"],
+      "frames": [
+        {"type": 1, "target": "update", "arguments": [{"throttling": {"CostQuota": 0}}]},
+        {"type": 3}
+      ],
+      "expect": {"outcome": "empty_quota", "invocation_submitted": true, "may_fail_over": true}
+    },
+    {
+      "id": "native_tool_only_success",
+      "handshake": ["{}"],
+      "tools": [
+        {"type": "function", "function": {"name": "read_file", "description": "Read a file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": false}}}
+      ],
+      "frames": [
+        {"type": 1, "target": "update", "arguments": [{"messages": [{"messageType": "Progress", "contentType": "ToolCall", "payload": {"functionName": "read_file", "functionArguments": {"path": "C:/workspace/README.md"}}}]}]},
+        {"type": 3}
+      ],
+      "expect": {"outcome": "success", "text": "", "tool_name": "read_file", "invocation_submitted": true}
+    },
+    {
+      "id": "image_only_success",
+      "handshake": ["{}"],
+      "frames": [
+        {"type": 1, "target": "update", "arguments": [{"messages": [{"content": {"image": {"downloadUrl": "https://cdn.example.test/image/generated.png"}}}]}]},
+        {"type": 3}
+      ],
+      "expect": {"outcome": "success", "text": "", "image_count": 1, "invocation_submitted": true}
+    },
+    {
+      "id": "unknown_frame_is_nonsemantic",
+      "handshake": ["{}"],
+      "frames": [
+        {"type": 42, "future": {"value": true}},
+        {"type": 1, "target": "update", "arguments": [{"writeAtCursor": "after drift"}]},
+        {"type": 3}
+      ],
+      "expect": {"outcome": "success", "text": "after drift", "invocation_submitted": true}
+    },
+    {
+      "id": "explicit_completion_error",
+      "handshake": ["{}"],
+      "frames": [{"type": 3, "error": "sanitized backend failure"}],
+      "expect": {"outcome": "completion_error", "invocation_submitted": true, "may_fail_over": false}
+    },
+    {
+      "id": "signalr_type7_close",
+      "handshake": ["{}"],
+      "frames": [{"type": 7, "error": "sanitized server timeout"}],
+      "expect": {"outcome": "closed", "invocation_submitted": true, "may_fail_over": false}
+    },
+    {
+      "id": "post_submit_socket_drop",
+      "handshake": ["{}"],
+      "frames": [],
+      "close_after_submit": true,
+      "expect": {"outcome": "transport_error", "invocation_submitted": true, "may_fail_over": false, "attempts": 1}
+    }
+  ]
+}

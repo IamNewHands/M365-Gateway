@@ -1,0 +1,34 @@
+# Local Cloudflare state and dependencies
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# Environment files and credentials
+.env
+.env.*
+!.env.example
+*.token
+*.tokens
+*.har
+cookies*.txt
+secrets/
+
+# Test and build output
+reports/
+dist/
+coverage/
+.e2e-opencode/
+*.log
+*.out
+
+# Optional relay build output
+optional-egress-relay/dist/
+optional-egress-relay/m365-egress-relay
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
