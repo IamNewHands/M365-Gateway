@@ -17,6 +17,24 @@ describe("Worker HTTP contract", () => {
     expect(response.status).toBe(200);
   });
 
+  it("rejects every server-side image generation endpoint before parsing a body or contacting an account", async () => {
+    for (const path of ["generations", "edits", "variations"]) {
+      const response = await SELF.fetch(`https://example.com/v1/images/${path}`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer m365_test_deployment_key_1234567890",
+          "Content-Type": "application/json",
+        },
+        body: "not-json",
+      });
+      expect(response.status).toBe(501);
+      expect(response.headers.get("X-M365-Error-Code")).toBe("image_generation_not_supported");
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "image_generation_not_supported" },
+      });
+    }
+  });
+
   it("restricts health to GET and attaches a stable error code", async () => {
     expect((await SELF.fetch("https://example.com/api/health")).status).toBe(200);
     const invalid = await SELF.fetch("https://example.com/api/health", { method: "POST" });
@@ -331,6 +349,82 @@ describe("Tenant upstream route fence", () => {
     const current = await state.acquireUpstream(firstId, "current-route", rebound?.routeEpoch);
     expect(current.ok).toBe(true);
     if (current.ok) await state.releaseUpstream(firstId, current.leaseId);
+  });
+});
+
+describe("Tenant upstream FIFO gate", () => {
+  const token = (id: string): OAuthTokenSet => ({
+    accessToken: `access-${id}`,
+    refreshToken: `refresh-${id}`,
+    expiresAt: Date.now() + 60 * 60_000,
+    email: `${id}@example.test`,
+    displayName: "FIFO gate test",
+    oid: id,
+    tid: crypto.randomUUID(),
+  });
+
+  it("grants a released gate strictly to the durable FIFO head", async () => {
+    const state = env.TENANTS.getByName(`fifo-${crypto.randomUUID()}`);
+    const accountId = crypto.randomUUID();
+    await state.upsertAccount(token(accountId));
+    const selected = await state.selectAccount();
+    expect(selected?.accountId).toBe(accountId);
+
+    const holder = await state.acquireUpstream(accountId, "holder", selected?.routeEpoch);
+    expect(holder.ok).toBe(true);
+    const firstWaiting = await state.acquireUpstream(accountId, "first", selected?.routeEpoch);
+    expect(firstWaiting.ok).toBe(false);
+    expect(firstWaiting.retryAfterMs).toBeGreaterThanOrEqual(50);
+    expect(firstWaiting.retryAfterMs).toBeLessThanOrEqual(5_000);
+    const secondWaiting = await state.acquireUpstream(accountId, "second", selected?.routeEpoch);
+    expect(secondWaiting).toMatchObject({ ok: false, retryAfterMs: 100 });
+    if (!holder.ok) throw new Error("holder lease was not acquired");
+
+    await state.releaseUpstream(accountId, holder.leaseId);
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
+    expect((await state.acquireUpstream(accountId, "second", selected?.routeEpoch)).ok).toBe(false);
+    const first = await state.acquireUpstream(accountId, "first", selected?.routeEpoch);
+    expect(first.ok).toBe(true);
+
+    await state.cancelUpstreamWaiter(accountId, "second");
+    if (first.ok) await state.releaseUpstream(accountId, first.leaseId);
+  });
+
+  it("expires an abandoned queue head well before the Worker gate deadline", async () => {
+    const state = env.TENANTS.getByName(`expiry-${crypto.randomUUID()}`);
+    const accountId = crypto.randomUUID();
+    await state.upsertAccount(token(accountId));
+    const selected = await state.selectAccount();
+    const holder = await state.acquireUpstream(accountId, "holder", selected?.routeEpoch);
+    expect(holder.ok).toBe(true);
+    expect((await state.acquireUpstream(accountId, "abandoned", selected?.routeEpoch)).ok).toBe(false);
+
+    // Simulate the next acquire after a 30-second client/network absence. The
+    // outer Worker gives the whole queue only 120 seconds, so a stale head
+    // must not retain the old 150-second lifetime.
+    expect(await state.expireUpstreamWaiters(Date.now() + 30_000)).toBe(1);
+
+    if (holder.ok) await state.releaseUpstream(accountId, holder.leaseId);
+  });
+
+  it("retires waiters selected against an account when its route changes", async () => {
+    const state = env.TENANTS.getByName(`route-waiters-${crypto.randomUUID()}`);
+    const firstId = crypto.randomUUID();
+    const secondId = crypto.randomUUID();
+    await state.upsertAccount(token(firstId));
+    await state.upsertAccount(token(secondId));
+    const selected = await state.selectAccount();
+    expect(selected?.accountId).toBe(firstId);
+
+    const holder = await state.acquireUpstream(firstId, "holder", selected?.routeEpoch);
+    expect(holder.ok).toBe(true);
+    expect((await state.acquireUpstream(firstId, "stale-waiter", selected?.routeEpoch)).ok).toBe(false);
+
+    await state.reportAccountFailure(firstId, "transient", selected?.routeEpoch);
+    expect((await state.selectAccount())?.accountId).toBe(secondId);
+    expect(await state.expireUpstreamWaiters(Date.now() + 60_000)).toBe(0);
+
+    if (holder.ok) await state.releaseUpstream(firstId, holder.leaseId);
   });
 });
 

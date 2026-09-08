@@ -159,6 +159,10 @@ export interface AccountPoolStatus {
 
 const UPSTREAM_LEASE_MS = 11 * 60_000;
 const UPSTREAM_MIN_INTERVAL_MS = 1_000;
+// The Worker polls an occupied gate at least every five seconds. Keep enough
+// slack for transient RPC latency, but expire an abandoned FIFO head well
+// before the Worker's independent two-minute account-queue deadline.
+const UPSTREAM_WAITER_TTL_MS = 15_000;
 const MAX_DIAGNOSTIC_RECORDS = 200;
 const MAX_RECORDED_REQUEST_IDS = 4_096;
 // Pruning the bounded audit rings on every request makes SQLite walk the
@@ -440,6 +444,18 @@ export class TenantState extends DurableObject<Env> {
     };
   }
 
+  /** Persist a route generation and retire every waiter selected against the
+   * previous owner. Those callers will observe the new epoch on their next
+   * poll; retaining them would let an abandoned stale waiter block the old
+   * account if routing later wraps back to it. */
+  private storeActiveAccountRoute(current: ActiveAccountRoute, next: ActiveAccountRoute): void {
+    this.setMeta("active_account_id", next.accountId);
+    this.setMeta("active_account_epoch", String(next.epoch));
+    if (current.accountId && current.accountId !== next.accountId) {
+      this.ctx.storage.sql.exec("DELETE FROM upstream_gate_waiters WHERE account_id=?", current.accountId);
+    }
+  }
+
   private orderedAvailableAccounts(afterSequence = Number.NEGATIVE_INFINITY): Array<{ id: string; sequence_no: number }> {
     const rows = this.ctx.storage.sql.exec<{ id: string; sequence_no: number }>(
       "SELECT id,sequence_no FROM accounts ORDER BY sequence_no,id",
@@ -467,8 +483,7 @@ export class TenantState extends DurableObject<Env> {
       accountId: selected?.id ?? "",
       epoch: current.epoch + (selected?.id === current.accountId ? 0 : 1),
     };
-    this.setMeta("active_account_id", next.accountId);
-    this.setMeta("active_account_epoch", String(next.epoch));
+    this.storeActiveAccountRoute(current, next);
     return next;
   }
 
@@ -488,8 +503,7 @@ export class TenantState extends DurableObject<Env> {
     ).toArray()[0]?.sequence_no ?? Number.NEGATIVE_INFINITY;
     const replacement = this.orderedAvailableAccounts(sequence).find((row) => row.id !== expectedAccountId);
     const next = { accountId: replacement?.id ?? "", epoch: current.epoch + 1 };
-    this.setMeta("active_account_id", next.accountId);
-    this.setMeta("active_account_epoch", String(next.epoch));
+    this.storeActiveAccountRoute(current, next);
     return next;
   }
 
@@ -963,10 +977,11 @@ export class TenantState extends DurableObject<Env> {
       // real FIFO queue instead of a timing race between polling requests.
       this.ctx.storage.sql.exec(
         `INSERT INTO upstream_gate_waiters(account_id,waiter_id,expires_at,created_at)
-         VALUES(?,?,?,?) ON CONFLICT(account_id,waiter_id) DO UPDATE SET expires_at=excluded.expires_at`,
+         VALUES(?,?,?,?) ON CONFLICT(account_id,waiter_id) DO UPDATE SET
+         expires_at=MAX(upstream_gate_waiters.expires_at,excluded.expires_at)`,
         id,
         waiter,
-        now + 150_000,
+        now + UPSTREAM_WAITER_TTL_MS,
         now,
       );
       const head = this.ctx.storage.sql.exec<{ waiter_id: string }>(
@@ -1445,8 +1460,7 @@ export class TenantState extends DurableObject<Env> {
     if (!found || !this.accountAvailabilityRow(accountId).available) return false;
     const route = this.activeAccountRoute();
     if (route.accountId === accountId) return true;
-    this.setMeta("active_account_id", accountId);
-    this.setMeta("active_account_epoch", String(route.epoch + 1));
+    this.storeActiveAccountRoute(route, { accountId, epoch: route.epoch + 1 });
     await this.scheduleNextAlarm();
     return true;
   }
@@ -1595,8 +1609,10 @@ export class TenantState extends DurableObject<Env> {
       }
       const activeId = resolved[activeSequence - 1]?.id ?? "";
       const route = this.activeAccountRoute();
-      this.setMeta("active_account_id", activeId);
-      this.setMeta("active_account_epoch", String(route.epoch + (route.accountId === activeId ? 0 : 1)));
+      this.storeActiveAccountRoute(route, {
+        accountId: activeId,
+        epoch: route.epoch + (route.accountId === activeId ? 0 : 1),
+      });
       const maximumSequence = this.ctx.storage.sql.exec<{ value: number }>(
         "SELECT COALESCE(MAX(sequence_no),0) AS value FROM accounts",
       ).one().value;
@@ -1674,8 +1690,7 @@ export class TenantState extends DurableObject<Env> {
       const active = this.activeAccountRoute();
       if (active.accountId === id) {
         const replacement = this.orderedAvailableAccounts(row.sequence_no)[0];
-        this.setMeta("active_account_id", replacement?.id ?? "");
-        this.setMeta("active_account_epoch", String(active.epoch + 1));
+        this.storeActiveAccountRoute(active, { accountId: replacement?.id ?? "", epoch: active.epoch + 1 });
       }
       this.ctx.storage.sql.exec(
         `INSERT INTO credential_mirror_deletions(account_id,kv_key,attempt_count,next_attempt_at,updated_at)

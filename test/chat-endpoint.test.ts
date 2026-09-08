@@ -233,6 +233,37 @@ describe("Chat Completions endpoint tool continuation regressions", () => {
     }
   }, 15_000);
 
+  it("semantically routes an OpenCode action when the primary answer only describes a plan", async () => {
+    const mutableEnv = env as typeof env & { DIRECT_NATIVE_TOOL_MODE?: string };
+    const previousMode = mutableEnv.DIRECT_NATIVE_TOOL_MODE;
+    mutableEnv.DIRECT_NATIVE_TOOL_MODE = "true";
+    try {
+      const apiKey = await credential();
+      const command = "npm run check";
+      const planOnly = "Apple 化重构计划包括首页、导航、卡片、后台、样式清理和构建验证。这些阶段按顺序推进。";
+      const { prompts } = installChatHub(({ prompt, socket }) => {
+        complete(socket, prompt.includes(ROUTER_MARKER)
+          ? routerCall("bash", { command })
+          : planOnly);
+      });
+
+      const response = await postChat(apiKey, [{
+        role: "user",
+        content: "一次性完成已经讨论好的全部重构工作，并在结束前验证结果。",
+      }]);
+      expect(response.status).toBe(200);
+      const body = await response.json<ChatCompletionBody>();
+      const call = onlyToolCall(body);
+      expect(call.function.name).toBe("bash");
+      expect(JSON.parse(call.function.arguments)).toEqual({ command });
+      expect(prompts).toHaveLength(2);
+      expect(prompts[1]).toContain("INITIAL CALLER-LOCAL TASK AUDIT");
+      expect(prompts[1]).toContain("一次性完成已经讨论好的全部重构工作");
+    } finally {
+      mutableEnv.DIRECT_NATIVE_TOOL_MODE = previousMode;
+    }
+  }, 20_000);
+
   it("repairs one malformed direct-native decision without restarting an OpenCode task", async () => {
     const mutableEnv = env as typeof env & { DIRECT_NATIVE_TOOL_MODE?: string };
     const previousMode = mutableEnv.DIRECT_NATIVE_TOOL_MODE;

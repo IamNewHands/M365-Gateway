@@ -37,6 +37,9 @@ assert.match(clientCompat, /terminateProcessTree/u);
 assert.match(clientCompat, /skipped: checks\.filter/u);
 assert.match(fullFunctional, /optional_image_capability_disabled/u);
 assert.match(fullFunctional, /M365_TEST_VISION_INPUT/u);
+assert.match(fullFunctional, /reason=image_generation_removed/u);
+assert.doesNotMatch(fullFunctional, /jsonRequest\("\/v1\/images\//u);
+assert.doesNotMatch(fullFunctional, /process\.env\.M365_TEST_IMAGE_GENERATION/u);
 assert.match(fullFunctional, /skipped: checks\.filter/u);
 // OpenCode's non-interactive child has stdin=ignore.  Keep its smoke calls
 // explicitly auto-approved so a write permission prompt cannot park the run

@@ -26,5 +26,9 @@ export default defineConfig({
   ],
   test: {
     include: ["test/**/*.test.ts"],
+    // The Responses/DO integration fixtures can take just over five seconds
+    // when the full 25-file suite starts together. Keep the test gate strict,
+    // but avoid treating normal worker startup contention as a code failure.
+    testTimeout: 15_000,
   },
 });

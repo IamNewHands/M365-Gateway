@@ -24,8 +24,14 @@ const DEFAULT_EVIDENCE_CHARACTERS = 8_000;
 const HARD_MAX_EVIDENCE_CHARACTERS = 32_000;
 
 const processExitSignal = /(?:^|\n)Process exited with code\s+(-?\d+)(?:\s|$)/iu;
-const leadingFailureSignal = /^(?:invalid\s+(?:patch|tool|arguments?|request|command|input)\s*:|errors?\s*:|failed\s*:|failure\s*:|exceptions?\s*:|traceback\b|permission denied\b|timed?\s*out\b|connection refused\b|\u9519\u8bef\s*[\uff1a:]|\u5931\u8d25\s*[\uff1a:]|\u8d85\u65f6\b|\u6743\u9650\u88ab\u62d2\u7edd\b)/iu;
+const leadingFailureSignal = /^(?:invalid\s+(?:patch|tool|arguments?|request|command|input)\s*:|errors?\s*:|failed\s*:|failure\s*:|exceptions?\s*:|traceback\b|permission denied\b|timed?\s*out\b|connection refused\b|not found\b|\u9519\u8bef\s*[\uff1a:]|\u5931\u8d25\s*[\uff1a:]|\u8d85\u65f6\b|\u6743\u9650\u88ab\u62d2\u7edd\b)/iu;
 const powershellFailureSignal = /^[A-Za-z][A-Za-z0-9_.-]*\s*:\s*(?:cannot\s+find\s+path|the\s+term\b[^\n]{0,160}\bis\s+not\s+recognized|access\s+(?:is\s+)?denied|permission\s+denied)/iu;
+// PowerShell 7 emits some failures as a diagnostic header followed by a
+// `Line |` block, without putting the error message on the first line. Codex
+// forwards only aggregated_output in this shape, so there may be no numeric
+// exit code in the API tool result. Match the structured diagnostic layout,
+// not arbitrary mentions of "error" in normal stdout.
+const powershellDiagnosticBlock = /^(?:(?:Parser|Runtime|NativeCommand|CommandNotFound|MethodInvocation|PropertyNotFound)Error|[A-Za-z]+-[A-Za-z][A-Za-z0-9]*)\s*:\s*\nLine\s*\|/iu;
 // A number of Windows/client wrappers prefix an error with the command name
 // (`Set-Content failed: ...`, `npm error: ...`) instead of returning an exit
 // code.  The command-name + explicit failure marker is strong structured
@@ -35,6 +41,7 @@ const commandFailureSignal = /^[A-Za-z][A-Za-z0-9_.-]*\s+(?:failed|error|failure
 const operationFailureSignal = /^(?:the\s+)?(?:command|operation|request|action)\s+(?:failed|error|failure)\b/iu;
 
 export type ToolProtocol = "chat" | "responses" | "seed";
+export type ToolEvidenceStatus = "success" | "failure" | "unknown";
 
 export type ToolLedgerIssueCode =
   | "missing_call_id"
@@ -72,6 +79,8 @@ export interface CompletedToolEvidence extends ToolCallRecord {
   normalizedResult: string;
   resultFingerprint: string;
   failed: boolean;
+  /** Tri-state completion status; `failed` remains for execution recovery compatibility. */
+  status: ToolEvidenceStatus;
   /** Non-reversible identity used to carry repeated-failure state across Responses aliases. */
   failureFingerprint?: string;
 }
@@ -120,6 +129,8 @@ export interface ToolLedgerSnapshotEntry {
   name: string;
   fingerprint: string;
   failed: boolean;
+  /** Preserves ambiguous wrapper results without promoting them on the next turn. */
+  status?: ToolEvidenceStatus;
   /** Number of completed executions represented by this opaque fingerprint. */
   completedCount?: number;
   /** SHA-256 identities only; raw tool errors are never persisted. */
@@ -390,6 +401,10 @@ function normalizeResult(value: string): string {
   return value.trim().replace(/\r\n?/gu, "\n").replace(/[\t ]+/gu, " ");
 }
 
+function normalizeStatusResult(value: string): string {
+  return normalizeResult(value).replace(/&(?:#x0*20|#0*32|nbsp);/giu, " ");
+}
+
 function normalizeFailure(value: string): string {
   return normalizeResult(value).toLowerCase().replace(/\d+/gu, "#").slice(0, 1_000);
 }
@@ -434,6 +449,51 @@ function parsedToolArguments(value: unknown): Record<string, unknown> | null {
   }
 }
 
+/** A successful local image read already supplied the pixels for this active
+ * turn. Models sometimes request the identical Windows path again while only
+ * toggling `detail`; treat that as the same completed observation. Historical
+ * snapshots intentionally omit raw arguments, so a later user turn may still
+ * request a fresh read of the same file. */
+function completedVisualReadPath(name: string, argumentsValue: unknown): string {
+  if (name.trim().toLowerCase() !== "view_image") return "";
+  const path = parsedToolArguments(argumentsValue)?.path;
+  if (typeof path !== "string" || !path.trim()) return "";
+  const normalized = path.trim().replaceAll("\\", "/").replace(/\/{2,}/gu, "/");
+  return /^[A-Za-z]:\//u.test(normalized) ? normalized.toLowerCase() : normalized;
+}
+
+/** Produce a small internal hint when a structured tool result strongly
+ * indicates that the command was sent to the wrong shell.  This never changes
+ * the command or result returned to the caller; it only gives the next model
+ * decision enough evidence to choose a different syntax instead of repeating
+ * the same parse failure. */
+function shellFailureDiagnostic(call: ToolCallRecord, value: string): string | undefined {
+  const argumentsValue = parsedToolArguments(call.arguments);
+  const command = typeof argumentsValue?.cmd === "string"
+    ? argumentsValue.cmd
+    : typeof argumentsValue?.command === "string" ? argumentsValue.command : "";
+  const declaredShell = typeof argumentsValue?.shell === "string"
+    ? argumentsValue.shell.trim().toLowerCase()
+    : "";
+  const normalized = normalizeResult(value);
+  const powershellFailure = /(?:ParserError|CommandNotFoundException|The term\b[^\n]{0,180}\bis not recognized|InvalidEndOfLine|Unexpected token|At line\s*:\s*\d+)/iu.test(normalized);
+  const unixFailure = /(?:\/bin\/(?:ba)?sh|bash|zsh|sh)\s*:\s*[^\n]{0,160}(?:command not found|syntax error|unexpected token)|command not found/iu.test(normalized);
+  const looksPosix = /(?:\b(?:find|grep|pwd|whoami)\b|&&|<<\s*['"]?[A-Za-z_][A-Za-z0-9_-]*)/iu.test(command);
+  const looksPowerShell = /(?:\b(?:Get|Set|Test|Select|Where|ForEach)-[A-Za-z][A-Za-z0-9-]*\b|\$[A-Za-z_][A-Za-z0-9_]*:|\$LASTEXITCODE\b|`[A-Za-z])/u.test(command);
+
+  if (powershellFailure && (declaredShell.includes("powershell") || declaredShell === "pwsh" || looksPosix)) {
+    return looksPosix
+      ? "shell_mismatch: the result has a PowerShell parser/command failure for POSIX-style syntax; keep the failed bytes as evidence and issue a new PowerShell-native command, or explicitly select Bash/WSL if that is the caller's declared shell"
+      : "shell_parse_failure: the result has a PowerShell parser/command failure; change quoting or syntax in a new command and do not repeat the same arguments";
+  }
+  if (unixFailure && (declaredShell === "bash" || declaredShell === "sh" || declaredShell === "zsh" || looksPowerShell)) {
+    return looksPowerShell
+      ? "shell_mismatch: the result has a POSIX shell failure for PowerShell-style syntax; keep the failed bytes as evidence and issue a new POSIX command, or explicitly select PowerShell if that is the caller's declared shell"
+      : "shell_parse_failure: the result has a POSIX shell parser/command failure; change quoting or syntax in a new command and do not repeat the same arguments";
+  }
+  return undefined;
+}
+
 /** A PTY write can be accepted by the transport while never being executed by
  * the remote shell. Some clients then return only the characters they wrote
  * (optionally wrapped in their normal session banner). Treat that as failed
@@ -461,26 +521,34 @@ function terminalWriteWasOnlyEcho(call: ToolCallRecord, value: string): boolean 
   return false;
 }
 
-function resultFailed(value: string, rawValue: unknown, call: ToolCallRecord): boolean {
+function resultStatus(value: string, rawValue: unknown, call: ToolCallRecord): ToolEvidenceStatus {
   const structured = structuredFailureStatus(rawValue);
-  if (structured !== null) return structured;
+  if (structured !== null) return structured ? "failure" : "success";
   // exec_command places its authoritative process result in the tool envelope,
   // before command stdout. A successful test may legitimately print words such
   // as ERROR, refused, or failed while exercising fallback/error paths; those
   // strings must not override an explicit outer exit code of zero.
-  const processExit = processExitSignal.exec(value.slice(0, 1_024));
-  if (processExit) return Number(processExit[1]) !== 0;
+  const statusValue = normalizeStatusResult(value);
+  const processExit = processExitSignal.exec(statusValue.slice(0, 1_024));
+  if (processExit) return Number(processExit[1]) !== 0 ? "failure" : "success";
   // Without an explicit status, treat tool output as untrusted payload rather
   // than scanning arbitrary source/log text for words such as "error" or
   // "failed". Only a leading status-style diagnostic is strong enough to mark
   // the call failed. This prevents successful reads from triggering recovery
   // loops merely because the file being inspected discusses an error path.
-  const leading = firstPayloadLine(value);
-  return leadingFailureSignal.test(leading)
+  const leading = firstPayloadLine(statusValue);
+  const failed = leadingFailureSignal.test(leading)
     || powershellFailureSignal.test(leading)
+    || powershellDiagnosticBlock.test(statusValue)
     || commandFailureSignal.test(leading)
     || operationFailureSignal.test(leading)
     || terminalWriteWasOnlyEcho(call, value);
+  if (failed) return "failure";
+  // The Code Mode wrapper reports only that its outer JavaScript cell ended.
+  // It is not evidence that nested commands succeeded when their structured
+  // exit status was discarded (for example by forwarding only `r.output`).
+  if (call.name.trim().toLowerCase() === "exec" && /^Script completed(?:\n|\s*$)/iu.test(statusValue)) return "unknown";
+  return "success";
 }
 
 function addIssue(state: MutableLedgerState, issue: ToolLedgerIssue): void {
@@ -599,8 +667,11 @@ async function consumeResult(
   const result = resultText(value);
   const normalizedResult = normalizeResult(result);
   const resultFingerprint = `sha256:${await sha256(normalizedResult)}`;
-  const failed = failedOverride ?? resultFailed(normalizedResult, value, call);
-  const evidence: CompletedToolEvidence = { ...call, result, normalizedResult, resultFingerprint, failed };
+  const status: ToolEvidenceStatus = failedOverride === undefined
+    ? resultStatus(normalizedResult, value, call)
+    : failedOverride ? "failure" : "success";
+  const failed = status === "failure";
+  const evidence: CompletedToolEvidence = { ...call, result, normalizedResult, resultFingerprint, failed, status };
 
   // Proposal-time repetition issues protect the boundary before a caller runs
   // a tool.  Once that caller returns a causally matched result, the action is
@@ -687,7 +758,8 @@ function addCompletedSnapshots(state: MutableLedgerState, snapshots: ToolLedgerS
         result: "completed in a prior Responses turn",
         normalizedResult: "completed in a prior Responses turn",
         resultFingerprint: "",
-        failed: Boolean(snapshot.failed),
+        failed: snapshot.status ? snapshot.status === "failure" : Boolean(snapshot.failed),
+        status: snapshot.status ?? (snapshot.failed ? "failure" : "success"),
         ...(failureFingerprints[occurrence] ? { failureFingerprint: failureFingerprints[occurrence] } : {}),
       });
     }
@@ -882,6 +954,7 @@ export function completedToolSnapshots(ledger: ToolLedger, maximum = DEFAULT_MAX
       // remain separately retained for loop prevention, but must not poison a
       // later successful repair and verification.
       failed: item.failed,
+      status: item.status,
       completedCount: Math.min(HARD_MAX_TOOL_ROUNDS, (previous?.completedCount ?? 0) + 1),
       ...(failureFingerprints.length > 0 ? { failureFingerprints } : {}),
       ...(repeatedFailure ? { repeatedFailure: true } : {}),
@@ -911,6 +984,10 @@ export async function guardProposedToolCalls(calls: ProposedToolCall[], ledger: 
 
   const completed = new Map<string, number>();
   for (const item of ledger.completed) completed.set(item.fingerprint, (completed.get(item.fingerprint) ?? 0) + 1);
+  const completedVisualReads = new Set(ledger.completed
+    .filter((item) => !item.failed)
+    .map((item) => completedVisualReadPath(item.name, item.arguments))
+    .filter(Boolean));
   const pending = new Set(ledger.pending.map((item) => item.fingerprint));
   const proposed = new Set<string>();
   const guarded: GuardedToolCall[] = [];
@@ -923,6 +1000,15 @@ export async function guardProposedToolCalls(calls: ProposedToolCall[], ledger: 
     if (!name) return { allowed: false, code: "missing_tool_name", message: "proposed tool call requires a non-empty function name" };
     const normalizedArguments = normalizeToolArguments(call.arguments);
     const fingerprint = await toolCallFingerprint(name, call.arguments);
+    const visualReadPath = completedVisualReadPath(name, call.arguments);
+    if (visualReadPath && completedVisualReads.has(visualReadPath)) {
+      return {
+        allowed: false,
+        code: "completed_call_reissued",
+        message: `tool call ${name} already returned this image in the active turn`,
+        fingerprint,
+      };
+    }
     const repeatedFailure = ledger.issues.find((issue) => issue.code === "repeated_failure" && issue.fingerprint === fingerprint);
     if (repeatedFailure) {
       return { allowed: false, code: "repeated_failure", message: repeatedFailure.message, fingerprint };
@@ -976,8 +1062,9 @@ export function completedEvidenceContext(ledger: ToolLedger, options: EvidenceCo
     name: compactMiddle(options.renderToolName?.(item.name) ?? item.name, 256),
     fingerprint: item.fingerprint,
     arguments: compactMiddle(redactEvidence(item.normalizedArguments), 1_000),
-    outcome: item.failed ? "failed" : "completed",
+    outcome: item.status === "unknown" ? "unknown" : item.failed ? "failed" : "completed",
     result: compactMiddle(redactEvidence(item.result), 2_000),
+    ...(item.failed ? { diagnostic: shellFailureDiagnostic(item, item.result) } : {}),
   }));
   let omitted = ledger.completed.length - selected.length;
   const prefix = "INTERNAL COMPLETED TOOL EVIDENCE. These are client-supplied results; the gateway did not execute these tools and must not claim that it did.\n";

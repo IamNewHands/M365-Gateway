@@ -23,7 +23,7 @@ describe("Responses session contention", () => {
     expect(upstreamGateRetryDelay(0, 0, 0)).toBe(0);
   });
 
-  it("keeps a two-minute gate wait below the RPC burst threshold", async () => {
+  it("keeps a logical-deadline gate wait below the RPC burst threshold", async () => {
     vi.useFakeTimers();
     try {
       let acquireCalls = 0;
@@ -41,10 +41,7 @@ describe("Responses session contention", () => {
         "account-1",
         1,
         undefined,
-        // Keep the logical request deadline beyond the independent two-minute
-        // account-gate budget so this assertion exercises ACCOUNT_QUEUE_TIMEOUT
-        // rather than the outer CHAT_DEADLINE_EXCEEDED branch.
-        Date.now() + 600_000,
+        Date.now() + 15_000,
       );
       // Attach the rejection handler before advancing fake time; otherwise
       // Vitest quite correctly reports the intentionally timed-out promise as
@@ -55,9 +52,9 @@ describe("Responses session contention", () => {
       );
       // Flush the complete bounded wait.  The exact number is deliberately
       // derived from the exported delay policy instead of a retry-count cap.
-      await vi.advanceTimersByTimeAsync(120_000);
-      await expect(outcome).resolves.toMatchObject({ message: "ACCOUNT_QUEUE_TIMEOUT" });
-      expect(acquireCalls).toBeLessThanOrEqual(32);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await expect(outcome).resolves.toMatchObject({ message: "CHAT_DEADLINE_EXCEEDED" });
+      expect(acquireCalls).toBeLessThanOrEqual(12);
       expect(acquireCalls).toBeGreaterThan(1);
       expect(cancelled).toBe(1);
     } finally {
@@ -73,10 +70,10 @@ describe("Responses session contention", () => {
         cancelUpstreamWaiter: async () => { throw new Error("transient cleanup transport failure"); },
       };
       const env = { TENANTS: { getByName: () => state } };
-      const pending = acquireUpstreamGate(env as never, "account-1", 1, undefined, Date.now() + 600_000);
+      const pending = acquireUpstreamGate(env as never, "account-1", 1, undefined, Date.now() + 15_000);
       const outcome = pending.then(() => null, (cause: unknown) => cause);
-      await vi.advanceTimersByTimeAsync(120_000);
-      await expect(outcome).resolves.toMatchObject({ message: "ACCOUNT_QUEUE_TIMEOUT" });
+      await vi.advanceTimersByTimeAsync(15_000);
+      await expect(outcome).resolves.toMatchObject({ message: "CHAT_DEADLINE_EXCEEDED" });
     } finally {
       vi.useRealTimers();
     }

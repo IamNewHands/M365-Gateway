@@ -20,7 +20,7 @@ import {
   mayFailOverChatHubFailure,
   preserveChatHubSubmissionHistory,
 } from "../src/chathub";
-import { adoptToolRouterResult, appendPortableProtocolTurn, assistantVisibleText, boundPublicExecFunctionCall, chatPrompt, compactCodeModeDescription, compactRetainedMessages, containsClientToolProtocolResidue, containsStructuralClientToolProtocolResidue, continuationCallerToolsFromLease, deterministicToolRouterRecovery, effectiveDirectToolChoice, escapePromptProtocolText, freshToolResultContinuationPrompt, guardAssistantCompletion, hasFreshCallerLocalContinuationEvidence, hasFreshCallerLocalFailureEvidence, hasPortableAccountRecovery, hydrateLeaseFromCompaction, isCallerLocalExecRefusal, latestPairedFunctionOutputCallId, normalizeResponsesCustomToolInput, observeStreamBackpressure, omitRecoveredPendingProposals, parseToolRouterDecision, portableAssistantResult, portableTurnLooksComplete, preferredSecondAttemptLocalToolName, publicCheckpointMetadata, publicFailure, recoverRepeatedPendingProposal, repairFunctionCallTaskAnchors, responseFunctionCallEvents, responsesInstructionsPrefix, responsesLiteCustomTools, responsesPrompt, restorePortableProtocolPrompt, responsesContinuationOutputIssue, sanitizePortableProtocolText, selectActiveResponsesInput, shouldAuditCallerLocalContinuation, shouldBufferToolStream, shouldForceDirectNativeToolChoice, shouldRecoverCallerLocalExecRefusal, shouldRecoverFableLocalExecRefusal, shouldRestoreChatPortableCheckpoint, shouldRestorePortableTaskFollowup, shouldRetryAccountRouteChanged, streamTextSuffix, toolRouterPrompt } from "../src/openai";
+import { adoptToolRouterResult, appendPortableProtocolTurn, assistantVisibleText, boundPublicExecFunctionCall, chatPrompt, compactCodeModeDescription, compactPortableTaskTail, compactRetainedMessages, containsClientToolProtocolResidue, containsStructuralClientToolProtocolResidue, continuationCallerToolsFromLease, deterministicToolRouterRecovery, effectiveDirectToolChoice, escapePromptProtocolText, freshToolResultContinuationPrompt, guardAssistantCompletion, hasFreshCallerLocalContinuationEvidence, hasFreshCallerLocalFailureEvidence, hasPortableAccountRecovery, hydrateLeaseFromCompaction, isCallerLocalExecRefusal, latestPairedFunctionOutputCallId, normalizeResponsesCustomToolInput, observeStreamBackpressure, omitRecoveredPendingProposals, parseToolRouterDecision, portableAssistantResult, portableTurnLooksComplete, preferredSecondAttemptLocalToolName, publicCheckpointMetadata, publicFailure, recoverRepeatedPendingProposal, repairFunctionCallTaskAnchors, responseFunctionCallEvents, responsesInstructionsPrefix, responsesLiteCustomTools, responsesPrompt, restorePortableProtocolPrompt, responsesContinuationOutputIssue, sanitizePortableProtocolText, selectActiveResponsesInput, shouldAuditCallerLocalContinuation, shouldBufferToolStream, shouldForceDirectNativeToolChoice, shouldRecoverCallerLocalExecRefusal, shouldRecoverFableLocalExecRefusal, shouldRestoreChatPortableCheckpoint, shouldRestorePortableTaskFollowup, shouldRetryAccountRouteChanged, streamTextSuffix, toolRouterPrompt } from "../src/openai";
 import { RequestMetricTracker } from "../src/request-metrics";
 import { validateToolArguments } from "../src/tool-schema";
 import { DEFAULT_MAX_TOOL_ROUNDS, completedEvidenceContext, completedToolSnapshots, guardProposedToolCalls, parseChatCompletionEvidenceLedger, parseChatToolLedger, parseResponsesToolLedger } from "../src/tool-ledger";
@@ -32,6 +32,7 @@ import { normalizeMultimodalContent, MultimodalInputError } from "../src/multimo
 describe("model catalog and ChatHub tones", () => {
   it("accepts the newly exposed Copilot model aliases", () => {
     expect(canonicalModel("gpt-5.6-think-deeper")).toBe("gpt-5.6-reasoning");
+    expect(canonicalModel(" GPT-6-ASTRA ")).toBe("gpt-6-astra");
     expect(canonicalModel(null)).toBe("gpt-5.6-sol");
     expect(canonicalModel("   ")).toBe("gpt-5.6-sol");
     expect(() => canonicalModel(42)).toThrowError("UNSUPPORTED_MODEL");
@@ -42,6 +43,8 @@ describe("model catalog and ChatHub tones", () => {
 
   it("maps the model ids to the observed upstream tones", () => {
     expect(modelTone("gpt-5.6-reasoning")).toBe("Gpt_5_6_Reasoning");
+    expect(modelTone("gpt-6-astra")).toBe("Gpt_6_Astra");
+    expect(modelTone("gpt-6-astra", "ultra")).toBe("Gpt_6_Astra");
   });
 
   it("keeps Sol's default and explicit fast/deep effort routes distinct", () => {
@@ -64,9 +67,16 @@ describe("model catalog and ChatHub tones", () => {
     const ids = modelCatalog().map((model) => model.id);
     expect(ids).toEqual([
       "gpt-5.5", "gpt-5.5-reasoning", "gpt-5.6-sol", "gpt-5.6-reasoning",
+      "gpt-6-astra",
       "claude-sonnet", "claude-sonnet-reasoning",
     ]);
     expect(ids.some((id) => /(?:quick|terra|5\.4|5\.3|5\.2|opus|fable)/iu.test(id))).toBe(false);
+    expect(modelCatalog().find((model) => model.id === "gpt-6-astra")).toMatchObject({
+      owned_by: "microsoft-365",
+      x_m365_availability: "tenant_dependent",
+      capabilities: { chat_completions: true, responses: true, vision: false, image_generation: false },
+      x_m365_reasoning: { summaries: false },
+    });
   });
 
   it("advertises a CPU-safe Codex compaction threshold", () => {
@@ -76,15 +86,21 @@ describe("model catalog and ChatHub tones", () => {
     for (const model of models) {
       expect(model.auto_compact_token_limit).toBe(CODEX_AUTO_COMPACT_TOKEN_LIMIT);
       expect(Number(model.auto_compact_token_limit)).toBeLessThan(Number(model.context_window));
+      if (String(model.slug).startsWith("gpt-")) {
+        expect(Number(model.context_window)).toBe(224_000);
+      }
     }
   });
 
-  it("exposes consistent reasoning selection metadata without claiming visible summaries", () => {
+  it("exposes consistent reasoning selection and only live-verified public summary capability", () => {
     for (const model of modelCatalog()) {
       const codex = codexModelCatalog().models.find((entry) => entry.slug === model.id);
       expect(model.supported_reasoning_levels).toEqual(codex?.supported_reasoning_levels);
       expect(model.default_reasoning_level).toEqual(codex?.default_reasoning_level);
-      expect(model.x_m365_reasoning).toMatchObject({ control: "tone_selection", summaries: false });
+      const summaryVerified = ["gpt-5.6-sol", "gpt-5.6-reasoning"].includes(String(model.id));
+      expect(model.x_m365_reasoning).toMatchObject({ control: "tone_selection", summaries: summaryVerified });
+      expect(codex?.default_reasoning_summary).toBe(summaryVerified ? "auto" : undefined);
+      if (summaryVerified) expect(model.x_m365_reasoning).toMatchObject({ summary_delivery: "end_of_turn", public_only: true });
     }
   });
 
@@ -102,6 +118,9 @@ describe("model catalog and ChatHub tones", () => {
     expect(String(sol?.base_instructions)).toContain("live schemas");
     expect(String(sol?.base_instructions)).toContain("group those writes into one call");
     expect(String(sol?.base_instructions)).toContain("Batch independent read-only checks");
+    expect(String(sol?.base_instructions)).toContain("SHELL DISCIPLINE");
+    expect(String(sol?.base_instructions)).toContain("do not send POSIX find/grep/pwd");
+    expect(String(sol?.base_instructions)).toContain("do not nest a shell heredoc");
     expect(String(sol?.base_instructions)).not.toContain("one-file write");
     expect(legacy).toMatchObject({ use_responses_lite: false, tool_mode: "direct" });
   });
@@ -594,6 +613,13 @@ describe("Fable caller-local refusal recovery", () => {
     tone: "Claude_Fable", toolChoice: "auto", tools: [execTool], prompt, responseText, ...overrides,
   });
 
+  const viewImageTool = chatFunctionTool(
+    "view_image",
+    "View an image file from the caller's local filesystem",
+    { path: { type: "string" }, detail: { type: "string", enum: ["high", "original"] } },
+    ["path"],
+  );
+
   it("recognizes English and Chinese refusals for pending local work", () => {
     expect(candidate("Inspect C:\\work\\gateway\\src\\openai.ts and fix the handler.", "I can't access the caller's local machine or use its local filesystem tools from this execution environment.")).toBe(true);
     expect(candidate("List C:\\work\\gateway.", "I can’t access or execute the caller’s local filesystem tools from this chat.")).toBe(true);
@@ -646,6 +672,39 @@ describe("Fable caller-local refusal recovery", () => {
     })).toBe(false);
   });
 
+  it("recovers false image-input refusals only when a visual reader is declared", () => {
+    const prompt = "[USER]\nC:\\Users\\exampleuser\\Desktop\\QQ\\_1788805277050.png\n\n你看到了什么";
+    const chineseRefusal = "我目前没有实际看到图片内容。刚才读取该路径时，当前环境不支持图像输入，所以我不能可靠描述画面。";
+    const englishRefusal = "I cannot see the actual image pixels because the current environment does not support image input.";
+
+    for (const responseText of [chineseRefusal, englishRefusal]) {
+      const input = {
+        tone: "Gpt_5_6_Chat",
+        toolChoice: "auto",
+        tools: [execTool, viewImageTool],
+        prompt,
+        responseText,
+      };
+      expect(isCallerLocalExecRefusal(input), responseText).toBe(true);
+      expect(shouldRecoverCallerLocalExecRefusal(input), responseText).toBe(true);
+    }
+
+    expect(isCallerLocalExecRefusal({
+      tone: "Gpt_5_6_Chat",
+      toolChoice: "auto",
+      tools: [execTool],
+      prompt,
+      responseText: chineseRefusal,
+    })).toBe(false);
+    expect(isCallerLocalExecRefusal({
+      tone: "Gpt_5_6_Chat",
+      toolChoice: "auto",
+      tools: undefined,
+      prompt,
+      responseText: chineseRefusal,
+    })).toBe(false);
+  });
+
   it("uses only a fresh structured local-tool result when Responses omits the original user turn", async () => {
     const refusal = "The current session does not expose the local Windows client execution tools, so I cannot continue.";
     const toolOnlyPrompt = "[ASSISTANT TOOL CALL call_1]\nexec_command({\"cmd\":\"Get-Content package.json\"})\n\n[TOOL RESULT call_1]\nProcess exited with code 0";
@@ -679,6 +738,14 @@ describe("Fable caller-local refusal recovery", () => {
     const powershellErrorLedger = await parseResponsesToolLedger([
       { type: "function_call", call_id: "call_ps_error", name: "exec_command", arguments: '{"cmd":"Get-Content missing.txt"}' },
       { type: "function_call_output", call_id: "call_ps_error", output: "Get-Content : Cannot find path 'missing.txt' because it does not exist." },
+    ]);
+    const powershellParserErrorLedger = await parseResponsesToolLedger([
+      { type: "function_call", call_id: "call_ps_parser", name: "exec_command", arguments: '{"cmd":"bad here string"}' },
+      { type: "function_call_output", call_id: "call_ps_parser", output: "ParserError:\r\nLine |\r\n   2 |  @\"<!DOCTYPE html>\r\n     |    ~\r\n     | No characters are allowed after a here-string header." },
+    ]);
+    const powershellCmdletBlockLedger = await parseResponsesToolLedger([
+      { type: "function_call", call_id: "call_ps_get_item", name: "exec_command", arguments: '{"cmd":"Get-Item index.html"}' },
+      { type: "function_call_output", call_id: "call_ps_get_item", output: "Get-Item:\r\nLine |\r\n   2 |  Get-Item index.html\r\n     |  ~~~~~~~~~~~~~~~~~~~\r\n     | Cannot find path 'C:\\work\\index.html' because it does not exist." },
     ]);
     const terminalEchoLedger = await parseResponsesToolLedger([
       { type: "function_call", call_id: "call_terminal_echo", name: "write_stdin", arguments: JSON.stringify({ session_id: 23889, chars: "systemctl status xinyu-backend\r" }) },
@@ -719,6 +786,8 @@ describe("Fable caller-local refusal recovery", () => {
     expect(hasFreshCallerLocalFailureEvidence([execTool], structuredZeroLedger)).toBe(false);
     expect(hasFreshCallerLocalFailureEvidence([execTool], structuredErrorLedger)).toBe(true);
     expect(hasFreshCallerLocalFailureEvidence([execTool], powershellErrorLedger)).toBe(true);
+    expect(hasFreshCallerLocalFailureEvidence([execTool], powershellParserErrorLedger)).toBe(true);
+    expect(hasFreshCallerLocalFailureEvidence([execTool], powershellCmdletBlockLedger)).toBe(true);
     const writeStdinTool = { type: "function", function: { name: "write_stdin", parameters: { type: "object" } } };
     expect(hasFreshCallerLocalFailureEvidence([writeStdinTool], terminalEchoLedger)).toBe(true);
     expect(hasFreshCallerLocalFailureEvidence([writeStdinTool], terminalOutputLedger)).toBe(false);
@@ -909,6 +978,9 @@ describe("Fable caller-local refusal recovery", () => {
     expect(compacted).toContain("retained interactive SSH session");
     expect(compacted).toContain("send the remote script through `write_stdin`");
     expect(compacted).toContain("do not repeat the same command or arguments");
+    expect(compacted).toContain("caller\'s declared shell/shell_type");
+    expect(compacted).toContain("do not send POSIX find/grep/pwd");
+    expect(compacted).toContain("Bash/WSL");
   });
 
   it("does not flatten programmatic-only namespace tools into direct plugins", () => {
@@ -1837,6 +1909,8 @@ describe("lossless client-tool transport", () => {
     expect(prompt).toContain('OUTPUT FORMAT: return exactly {"calls":[{"name":"WIRE_NAME","arguments":{...}}]}');
     expect(prompt).toContain("supplied client tool schema");
     expect(prompt).toContain("do not assume an order or a fixed number of steps");
+    expect(prompt).toContain("SHELL COMPATIBILITY");
+    expect(prompt).toContain("never mix Bash/POSIX syntax with PowerShell");
     expect(prompt).not.toContain("bounded inventory");
     expect(prompt).not.toContain("120,000 characters");
     const schemaJSON = prompt.split("AVAILABLE_TOOL_SCHEMAS: ")[1]?.split("\nAPPLICATION_REQUEST_AND_EVIDENCE:")[0];
@@ -1915,6 +1989,33 @@ describe("lossless client-tool transport", () => {
     expect(JSON.parse(parsed.call?.arguments ?? "null")).toEqual({ cmd: "Get-ChildItem" });
   });
 
+  it("recovers bounded router serialization variants without mining prose", () => {
+    const alias = clientToolWireName("exec_command");
+    const envelope = JSON.stringify({ calls: [{ name: alias, arguments: { cmd: "Get-ChildItem" } }] });
+    const variants = [
+      JSON.stringify(envelope),
+      `${envelope};`,
+      `<tool_call>${envelope}</tool_call>`,
+      `工具调用：\n\`\`\`json\n${envelope}\n\`\`\``,
+    ];
+    for (const variant of variants) {
+      const parsed = parseToolRouterDecision(variant, [execTool], { type: "function", name: "exec_command" });
+      expect(parsed.valid).toBe(true);
+      expect(parsed.call?.name).toBe("exec_command");
+      expect(JSON.parse(parsed.call?.arguments ?? "null")).toEqual({ cmd: "Get-ChildItem" });
+    }
+  });
+
+  it("serializes multiple router proposals by issuing only the first validated call", () => {
+    const alias = clientToolWireName("exec_command");
+    const parsed = parseToolRouterDecision(JSON.stringify({ calls: [
+      { name: alias, arguments: { cmd: "Get-ChildItem" } },
+      { name: alias, arguments: { cmd: "Get-Location" } },
+    ] }), [execTool], { type: "function", name: "exec_command" });
+    expect(parsed.valid).toBe(true);
+    expect(JSON.parse(parsed.call?.arguments ?? "null")).toEqual({ cmd: "Get-ChildItem" });
+  });
+
   it("rejects a single JSON fence surrounded by long prose or a non-allowlisted preface", () => {
     const alias = clientToolWireName("exec_command");
     const envelope = JSON.stringify({ calls: [{ name: alias, arguments: { cmd: "Get-ChildItem" } }] });
@@ -1986,11 +2087,11 @@ describe("lossless client-tool transport", () => {
     expect(parsed?.name).toBe("exec_command");
     expect(JSON.parse(parsed?.arguments ?? "{}")).toMatchObject({ cmd: "Get-ChildItem" });
     const bounded = boundPublicExecFunctionCall(parsed);
-    expect(JSON.parse(bounded?.arguments ?? "{}").max_output_tokens).toBe(12000);
-    expect(JSON.parse(bounded?.arguments ?? "{}").yield_time_ms).toBe(30000);
+    expect(JSON.parse(bounded?.arguments ?? "{}").max_output_tokens).toBe(50000);
+    expect(JSON.parse(bounded?.arguments ?? "{}").yield_time_ms).toBe(60000);
   });
 
-  it("survives a legacy exec schema while bounding newer controls", () => {
+  it("survives a legacy exec schema while preserving newer controls", () => {
     const wireName = clientToolWireName("exec_command");
     const legacyTool = {
       type: "function",
@@ -2012,8 +2113,8 @@ describe("lossless client-tool transport", () => {
     expect(parsed?.name).toBe("exec_command");
     const bounded = boundPublicExecFunctionCall(parsed);
     const args = JSON.parse(bounded?.arguments ?? "{}");
-    expect(args.max_output_tokens).toBe(12000);
-    expect(args.yield_time_ms).toBe(30000);
+    expect(args.max_output_tokens).toBe(50000);
+    expect(args.yield_time_ms).toBe(60000);
   });
 
   it("keeps ordinary textual parsing strict for an opaque alias", () => {
@@ -2047,6 +2148,7 @@ describe("lossless client-tool transport", () => {
   it("repairs orphan AZHEX X markers only against an exact task path anchor", () => {
     const call = repairFunctionCallTaskAnchors({
       name: "exec_command",
+      argumentEncoding: "legacy_azhex",
       arguments: JSON.stringify({
         cmd: "Get-ChildItem -LiteralPath 'C:\\Users\\exampleuser\\Desktop\\服务X器X'",
         workdir: "C:\\Users\\exampleuser\\Desktop",
@@ -2059,6 +2161,7 @@ describe("lossless client-tool transport", () => {
     // reported directory name: any retained non-ASCII path can be restored.
     const generic = repairFunctionCallTaskAnchors({
       name: "exec_command",
+      argumentEncoding: "legacy_azhex",
       arguments: JSON.stringify({ cmd: "Get-ChildItem -LiteralPath 'D:\\研X发X资X料X\\报X告X'" }),
     }, [{ kind: "windows_path", value: "D:\\研发资料\\报告" }]);
     expect(JSON.parse(generic.arguments).cmd)
@@ -2066,6 +2169,7 @@ describe("lossless client-tool transport", () => {
 
     const quotedSuffixes = repairFunctionCallTaskAnchors({
       name: "exec_command",
+      argumentEncoding: "legacy_azhex",
       arguments: JSON.stringify({
         space: "Get-Item 'D:\\研X发X资X料X more'",
         comma: "Get-Item 'D:\\研X发X资X料X,backup'",
@@ -2082,12 +2186,14 @@ describe("lossless client-tool transport", () => {
 
     const unanchored = repairFunctionCallTaskAnchors({
       name: "exec_command",
+      argumentEncoding: "legacy_azhex",
       arguments: JSON.stringify({ cmd: "Get-ChildItem -LiteralPath 'C:\\Users\\exampleuser\\Desktop\\服务X器X'" }),
     });
     expect(JSON.parse(unanchored.arguments).cmd).toContain("服务X器X");
 
     const longerPaths = repairFunctionCallTaskAnchors({
       name: "exec_command",
+      argumentEncoding: "legacy_azhex",
       arguments: JSON.stringify({
         child: "C:\\Users\\exampleuser\\Desktop\\服务X器X\\logs",
         sibling: "C:\\Users\\exampleuser\\Desktop\\服务X器X-backup",
@@ -2102,6 +2208,7 @@ describe("lossless client-tool transport", () => {
 
     const legitimateXAnchor = repairFunctionCallTaskAnchors({
       name: "exec_command",
+      argumentEncoding: "legacy_azhex",
       arguments: JSON.stringify({ cmd: "Get-ChildItem -LiteralPath 'C:\\Users\\exampleuser\\Desktop\\服务X器X'" }),
     }, [{ kind: "windows_path", value: "C:\\Users\\exampleuser\\Desktop\\服务器X" }]);
     expect(JSON.parse(legitimateXAnchor.arguments).cmd)
@@ -2109,6 +2216,7 @@ describe("lossless client-tool transport", () => {
 
     const retainedExactX = repairFunctionCallTaskAnchors({
       name: "exec_command",
+      argumentEncoding: "legacy_azhex",
       arguments: JSON.stringify({ cmd: "Get-ChildItem -LiteralPath 'C:\\Users\\exampleuser\\Desktop\\服务器X'" }),
     }, [
       { kind: "windows_path", value: "C:\\Users\\exampleuser\\Desktop\\服务器" },
@@ -2119,6 +2227,7 @@ describe("lossless client-tool transport", () => {
 
     const ambiguous = repairFunctionCallTaskAnchors({
       name: "exec_command",
+      argumentEncoding: "legacy_azhex",
       arguments: JSON.stringify({ cmd: "Get-ChildItem -LiteralPath 'C:\\Users\\exampleuser\\Desktop\\服务X器X'" }),
     }, [
       { kind: "windows_path", value: "C:\\Users\\exampleuser\\Desktop\\服务X器" },
@@ -2128,7 +2237,7 @@ describe("lossless client-tool transport", () => {
       .toBe("Get-ChildItem -LiteralPath 'C:\\Users\\exampleuser\\Desktop\\服务X器X'");
   });
 
-  it("preserves a semantically rich local command while bounding execution resources", () => {
+  it("preserves a semantically rich local command and caller execution parameters", () => {
     const command = "Write-Output 'SOURCE INVENTORY'; Get-ChildItem -Recurse -File | Select-Object -First 500 FullName; Get-Content a.ts; Get-Content b.ts; Get-Content c.ts";
     const call = boundPublicExecFunctionCall({
       name: "exec_command",
@@ -2142,21 +2251,21 @@ describe("lossless client-tool transport", () => {
     expect(call?.name).toBe("exec_command");
     const args = JSON.parse(call?.arguments ?? "{}");
     expect(args.cmd).toBe(command);
-    expect(args.max_output_tokens).toBe(12000);
-    expect(args.yield_time_ms).toBe(30000);
+    expect(args.max_output_tokens).toBe(50000);
+    expect(args.yield_time_ms).toBe(60000);
   });
 
-  it("replaces only an objectively oversized local command with a bounded first step", () => {
+  it("does not substitute a directory scan for a long local command", () => {
+    const command = `Get-ChildItem -Recurse; ${"Get-Content file.ts; ".repeat(200)}`;
     const call = boundPublicExecFunctionCall({
       name: "exec_command",
       arguments: JSON.stringify({
-        cmd: `Get-ChildItem -Recurse; ${"Get-Content file.ts; ".repeat(200)}`,
+        cmd: command,
         workdir: "C:\\\\Users\\\\exampleuser\\\\Desktop\\\\CS",
       }),
     });
     const args = JSON.parse(call?.arguments ?? "{}");
-    expect(args.cmd).toContain("Select-Object -First 200");
-    expect(args.cmd.length).toBeLessThan(500);
+    expect(args.cmd).toBe(command);
   });
 
   it("rejects a malformed sensitive call at the last public boundary", () => {
@@ -2201,6 +2310,20 @@ describe("lossless client-tool transport", () => {
     const evidence = completedEvidenceContext(ledger, { renderToolName: clientToolWireName });
     expect(evidence).toContain(`"name":"${alias}"`);
     expect(evidence).not.toContain('"name":"glob"');
+  });
+
+  it("adds a shell-mismatch hint to internal failure evidence without rewriting the command", async () => {
+    const command = "find /home/ec2-user -maxdepth 4 ( -name package.json )";
+    const messages = [
+      { role: "user", content: "inspect the project" },
+      { role: "assistant", content: "", tool_calls: [{ id: "call-shell", type: "function", function: { name: "exec_command", arguments: JSON.stringify({ cmd: command, shell: "powershell" }) } }] },
+      { role: "tool", tool_call_id: "call-shell", content: "CommandNotFoundException: The term 'find' is not recognized as the name of a cmdlet" },
+    ];
+    const ledger = await parseChatToolLedger(messages, { activeChatTurnOnly: false });
+    const evidence = completedEvidenceContext(ledger);
+    expect(evidence).toContain("shell_mismatch");
+    expect(evidence).toContain("PowerShell-native command");
+    expect(evidence).toContain(command);
   });
 
   it("restores a sanitized checkpoint only for output-only Chat tool continuation", () => {
@@ -2290,14 +2413,28 @@ describe("lossless client-tool transport", () => {
     );
     const lease = { portableProtocolTail: tail };
 
-    for (const request of ["[USER]\n继续", "[USER]\n你倒是做啊", "[USER]\n部署", "[USER]\ngo do it"]) {
+    for (const request of ["[USER]\n继续", "[USER]\n你倒是做啊", "[USER]\n部署", "[USER]\ngo do it", "[USER]\n告诉我进度", "[USER]\n按现有设计把剩余阶段收尾"]) {
       expect(shouldRestorePortableTaskFollowup(lease, request), request).toBe(true);
       const restored = restorePortableProtocolPrompt(tail, request, 20_000, 20_000);
       expect(restored).toContain("HTML 游戏");
       expect(restored).toContain(request);
     }
-    expect(shouldRestorePortableTaskFollowup(lease, "[USER]\n为什么普通对话会丢上下文？")).toBe(false);
+    expect(shouldRestorePortableTaskFollowup(lease, "[USER]\n为什么普通对话会丢上下文？")).toBe(true);
     expect(shouldRestorePortableTaskFollowup({ portableProtocolTail: "" }, "[USER]\n继续")).toBe(false);
+  });
+
+  it("persists the retained assistant task summary in the compact portable tail", () => {
+    const summary = "正在重构 BK 首页；导航和卡片已完成，后台与构建验证仍待执行。";
+    const tail = compactPortableTaskTail([
+      { type: "message", role: "user", content: [{ type: "input_text", text: "把 BK 全面重构为 Apple 风格。" }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: summary }] },
+      { type: "function_call_output", call_id: "call_hidden", output: "secret raw output" },
+    ]);
+    const restored = restorePortableProtocolPrompt(tail, "[USER]\n告诉我进度", 20_000, 20_000);
+    expect(restored).toContain("PORTABLE HISTORY FROM THE SAME API-CREDENTIAL SESSION");
+    expect(tail).toContain("把 BK 全面重构为 Apple 风格");
+    expect(tail).toContain(summary);
+    expect(tail).not.toContain("secret raw output");
   });
 });
 
@@ -2526,6 +2663,31 @@ describe("tool-loop continuation", () => {
     await expect(guardProposedToolCalls([
       { name: "exec_command", arguments: '{"cmd":"Get-Item b"}' },
     ], ledger)).resolves.toMatchObject({ allowed: true });
+  });
+
+  it("blocks a completed view_image path even when only detail or Windows path spelling changes", async () => {
+    const ledger = await parseResponsesToolLedger([
+      {
+        type: "function_call",
+        call_id: "call-image",
+        name: "view_image",
+        arguments: '{"detail":"high","path":"C:\\\\Users\\\\exampleuser\\\\Desktop\\\\screen.png"}',
+      },
+      {
+        type: "function_call_output",
+        call_id: "call-image",
+        output: [{ type: "input_text", text: "Image loaded successfully." }],
+      },
+    ]);
+
+    await expect(guardProposedToolCalls([{
+      name: "view_image",
+      arguments: { detail: "original", path: "c:/users/exampleuser/desktop/screen.png" },
+    }], ledger)).resolves.toMatchObject({ allowed: false, code: "completed_call_reissued" });
+    await expect(guardProposedToolCalls([{
+      name: "view_image",
+      arguments: { detail: "original", path: "C:/Users/exampleuser/Desktop/another.png" },
+    }], ledger)).resolves.toMatchObject({ allowed: true });
   });
 
   it("permits one verification replay but blocks a third unchanged action", async () => {

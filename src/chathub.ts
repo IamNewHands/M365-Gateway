@@ -1,5 +1,5 @@
 import { base64url } from "./crypto";
-import { uploadConversationImages } from "./image-upload";
+import { MULTI_IMAGE_UPLOAD_OPTION, uploadConversationImages, type UploadedConversationImage } from "./image-upload";
 import type { OAuthTokenSet } from "./types";
 import {
   extractUpstreamImageURLs,
@@ -23,6 +23,8 @@ const MAX_FRAME_CHARACTERS = 1_500_000;
 // before TextDecoder allocates a second large string in the Worker isolate.
 const MAX_FRAME_EARLY_REJECT_BYTES = MAX_FRAME_CHARACTERS * 4;
 const MAX_OUTPUT_CHARACTERS = 2_000_000;
+const MAX_PUBLIC_REASONING_SUMMARY_CHARACTERS = 16_384;
+const MAX_PUBLIC_REASONING_SUMMARY_PARTS = 64;
 const MAX_QUEUED_SOCKET_CHARACTERS = 2_000_000;
 // SignalR normally carries only a handful of records per WebSocket message.
 // A bounded total keeps a malformed stream of tiny records from spending the
@@ -102,6 +104,7 @@ const CHAT_PROGRESS_IDLE_TIMEOUT_MS = 90_000;
 // consuming most of the client's idle window before any invocation exists.
 const CHAT_HANDSHAKE_TIMEOUT_MS = 15_000;
 const VARIANTS = "EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableLuForChatCIQ,feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,feature.enablechatpages,feature.enableCodeCanvas,feature.turnOnWorkTabRecommendation,turnOffWorkTabUpsellFromClient,feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,feature.EnableDeduplicatingSourceAttributions,Enable3PActionProgressMessages,feature.enableClientWebRtc,feature.EnableMeetingRecapOfSeriesMeetingWithCiq,feature.EnableReferencesListCompleteSignal,feature.StorageMessageSplitDisabled,feature.EnableCuaTakeControlApi,feature.cwcallowedos,feature.disabledisallowedmsgs,feature.enableCitationsForSynthesisData,feature.enableGenerateGraphicArtOptionsSet,cdximagen,feature.EnableUpdatedUXForConfirmationDialog,feature.EnableClientFileURLSupportForOfficeWebPaidCopilot,feature.EnableDesignEditorImageGrounding,feature.EnableDesignerEditor,feature.OfficeWebToHelix,feature.OfficeDesktopToHelix,feature.M365TeamsHubToHelix,feature.OwaHubToHelix,feature.MonarchHubToHelix,feature.Win32OutlookHubToHelix,feature.MacOutlookHubToHelix,Agt_bizchat_enableGpt5ForHelix";
+const IMAGE_FILE_VARIANT = "cdxodimgupload";
 
 export interface ChatHubRequest {
   text: string;
@@ -123,6 +126,8 @@ export interface ChatHubRequest {
 
 export interface ChatHubResult {
   text: string;
+  /** Actual upstream public summary texts only; absent when none was received. */
+  publicReasoningSummary?: string[];
   conversationId: string;
   sessionId: string;
   requestId: string;
@@ -143,6 +148,10 @@ export interface ChatHubResult {
 export interface FunctionCall {
   name: string;
   arguments: string;
+  /** Internal parser provenance, set only after decoding the explicit legacy
+   * transport. Native and structured JSON arguments must never be repaired
+   * based on marker-looking text or approximate historical paths. */
+  argumentEncoding?: "legacy_azhex";
 }
 
 function safeProtocolLabel(value: unknown): string {
@@ -206,13 +215,13 @@ function relayOrigin(value: string): string {
   return url.origin;
 }
 
-function relayTargetQuery(sessionId: string, conversationId: string, requestId: string): string {
+function relayTargetQuery(sessionId: string, conversationId: string, requestId: string, imageFiles = false): string {
   const query = new URLSearchParams();
   query.set("chatsessionid", requestId);
   query.set("clientrequestid", requestId);
   query.set("X-SessionId", sessionId);
   query.set("ConversationId", conversationId);
-  query.set("variants", VARIANTS);
+  query.set("variants", imageFiles ? `${VARIANTS},${IMAGE_FILE_VARIANT}` : VARIANTS);
   query.set("source", '"officeweb"');
   query.set("product", "Office");
   query.set("agentHost", "Bizchat.FullScreen");
@@ -228,6 +237,7 @@ async function relayWebSocketRequest(
   conversationId: string,
   requestId: string,
   relay: ChatHubRelay,
+  imageFiles = false,
 ): Promise<{ url: string; headers: Headers }> {
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
   if (!uuid.test(account.oid) || !uuid.test(account.tid)
@@ -239,7 +249,7 @@ async function relayWebSocketRequest(
   const identity = `${account.oid.toLowerCase()}@${account.tid.toLowerCase()}`;
   const path = `/v1/chathub/${identity}`;
   const url = new URL(path, base);
-  const targetQuery = relayTargetQuery(sessionId, conversationId, requestId);
+  const targetQuery = relayTargetQuery(sessionId, conversationId, requestId, imageFiles);
   const tokenBytes = textEncoder.encode(account.accessToken).byteLength;
   const queryBytes = textEncoder.encode(targetQuery).byteLength;
   if (tokenBytes === 0 || tokenBytes > 32 * 1024 || queryBytes > 16 * 1024) {
@@ -711,7 +721,11 @@ export function normalizeClientFunctionCall(
     argumentsJSON = JSON.stringify(normalizedArguments);
   } catch { return null; }
   if (!acceptsDecodedClientCall({ name: originalName, arguments: argumentsJSON }, tools)) return null;
-  return { name: originalName, arguments: argumentsJSON };
+  return {
+    name: originalName,
+    arguments: argumentsJSON,
+    ...(call.argumentEncoding === "legacy_azhex" ? { argumentEncoding: "legacy_azhex" as const } : {}),
+  };
 }
 
 function callFromJSON(
@@ -762,7 +776,11 @@ function callFromJSON(
       : decodedRaw;
     if (safeAlias && (decoded === null || (!legacyPayload && !allowSafePlainText))) return null;
     const args = encodedArguments(decoded);
-    if (args) return { name: originalName, arguments: args };
+    if (args) return {
+      name: originalName,
+      arguments: args,
+      ...(legacyPayload ? { argumentEncoding: "legacy_azhex" as const } : {}),
+    };
   }
   for (const name of names) {
     if (!(name in record)) continue;
@@ -780,7 +798,11 @@ function callFromJSON(
       : decodedRaw;
     if (safeAlias && (decoded === null || (!legacyPayload && !allowSafePlainText))) return null;
     const args = encodedArguments(decoded);
-    if (args) return { name: inferredWireName ?? inferredName, arguments: args };
+    if (args) return {
+      name: inferredWireName ?? inferredName,
+      arguments: args,
+      ...(legacyPayload ? { argumentEncoding: "legacy_azhex" as const } : {}),
+    };
   }
   return null;
 }
@@ -1010,7 +1032,7 @@ export function parseFunctionCall(
           && (decodedObject.workdir === undefined || typeof decodedObject.workdir === "string")
           && (decodedObject.shell === undefined || typeof decodedObject.shell === "string");
         if (args && (acceptsDecodedClientCall({ name: wireName, arguments: args }, tools) || boundedExecFallback)) {
-          return { name: wireName, arguments: args };
+          return { name: wireName, arguments: args, argumentEncoding: "legacy_azhex" };
         }
         continue;
       }
@@ -1149,14 +1171,15 @@ export function hasNativeFunctionCallEnvelope(value: unknown): boolean {
   return walk(value, 0);
 }
 
-function webSocketURL(account: OAuthTokenSet, sessionId: string, conversationId: string, requestId: string): string {
+function webSocketURL(account: OAuthTokenSet, sessionId: string, conversationId: string, requestId: string, imageFiles = false): string {
   const url = new URL(`${CHAT_HUB}/${encodeURIComponent(account.oid)}@${encodeURIComponent(account.tid)}`);
   url.searchParams.set("chatsessionid", requestId);
+  url.searchParams.set("XRoutingParameterSessionKey", requestId);
   url.searchParams.set("clientrequestid", requestId);
   url.searchParams.set("X-SessionId", sessionId);
   url.searchParams.set("ConversationId", conversationId);
   url.searchParams.set("access_token", account.accessToken);
-  url.searchParams.set("variants", VARIANTS);
+  url.searchParams.set("variants", imageFiles ? `${VARIANTS},${IMAGE_FILE_VARIANT}` : VARIANTS);
   url.searchParams.set("source", '"officeweb"');
   url.searchParams.set("product", "Office");
   url.searchParams.set("agentHost", "Bizchat.FullScreen");
@@ -1234,14 +1257,76 @@ export function chatHubAllowedMessageTypes(
   return [...(compact ? COMPACT_MESSAGE_TYPES : ANSWER_MESSAGE_TYPES)];
 }
 
-function buildChatPayload(request: ChatHubRequest, requestId: string, attachments: ChatHubImageAttachment[]): string {
+// ImageFile annotations and UploadFile must select the same official web
+// client feature set. Sending only the GPT-V flags leaves the docId bound but
+// can omit the file-reference and rich-response processors that consume it.
+const UPLOADED_IMAGE_OPTION_SETS = Object.freeze([
+  "search_result_progress_messages_with_search_queries",
+  "update_textdoc_response_after_streaming",
+  "deepleo_networking_timeout_10minutes_canmore",
+  "cwc_flux_image",
+  "cwc_code_interpreter",
+  "cwc_code_interpreter_amsfix",
+  "cwcfluxgptv",
+  MULTI_IMAGE_UPLOAD_OPTION,
+  "gptvnorm2048",
+  "cwc_code_interpreter_citation_fix",
+  "code_interpreter_interactive_charts",
+  "cwc_code_interpreter_interactive_charts_inline_image",
+  "code_interpreter_matplotlib_patching",
+  "cwc_fileupload_odb",
+  "update_memory_plugin",
+  "add_custom_instructions",
+  "cwc_flux_v3",
+  "flux_v3_progress_messages",
+  "enable_batch_token_processing",
+  "enable_gg_gpt",
+  "async_client_interaction",
+  "enable_inferred_memory_read",
+  "flux_v3_references",
+  "flux_v3_references_entities",
+  "flux_v3_references_ci",
+  "add_filestore_filetype",
+  "cwc_code_interpreter_citation_sourceannotations",
+  "cdxcwc_code_interpreter_hallucinated_url_filter",
+  "flux_v3_image_gen_enable_dimensions",
+  "flux_v3_image_gen_enable_non_watermarked_storage",
+  "flux_v3_image_gen_enable_icon_dimensions",
+  "flux_v3_image_gen_enable_system_text_with_params",
+  "flux_v3_image_gen_enable_designer_dimensions_meta_prompting_in_system_prompts",
+  "flux_v3_image_gen_enable_story",
+  "rich_responses",
+]);
+
+function buildChatPayload(request: ChatHubRequest, requestId: string, attachments: ChatHubImageAttachment[], uploadedImages: ReadonlyArray<UploadedConversationImage> = []): string {
+  if (uploadedImages.some(image => image.conversationId !== request.conversationId)) throw new Error("IMAGE_UPLOAD_NOT_BOUND");
+  // UploadFile stores the bytes against the conversation. ChatHub still needs
+  // each returned docId as an ImageFile annotation to place those pixels in the
+  // model context; never replay caller metadata or the original data URI here.
+  const imageFields = uploadedImages.length ? {
+    entityAnnotationTypes: ["People", "File", "Event", "Email", "TeamsMessage"],
+    messageAnnotations: uploadedImages.map(image => {
+      const fileType = image.mimeType === "image/jpeg" ? "jpg" : image.mimeType.slice("image/".length);
+      return {
+        id: image.docId,
+        ...(image.fileUrl ? { url: image.fileUrl } : {}),
+        messageAnnotationMetadata: {
+          "@type": "File",
+          annotationType: "File",
+          fileType,
+          fileName: `image.${fileType}`,
+        },
+        messageAnnotationType: "ImageFile",
+      };
+    }),
+  } : {};
   const plugins = runtimeClientPlugins(request.tools, request.toolChoice);
   const invocation = {
     arguments: [{
       source: "officeweb",
       clientCorrelationId: crypto.randomUUID(),
       sessionId: request.sessionId,
-      optionsSets: [],
+      optionsSets: uploadedImages.length ? [...UPLOADED_IMAGE_OPTION_SETS] : [],
       spokenTextMode: "None",
       options: {},
       extraExtensionParameters: {},
@@ -1265,7 +1350,8 @@ function buildChatPayload(request: ChatHubRequest, requestId: string, attachment
       streamingMode: "ConciseWithPadding",
       message: {
         author: "user",
-        attachments,
+        ...(attachments.length ? { attachments } : {}),
+        ...imageFields,
         inputMethod: "Keyboard",
         text: toolProtocolPrompt(request.text, request.tools, request.toolChoice),
         requestId,
@@ -1745,6 +1831,39 @@ export function chatHubAnswerMessageText(message: Record<string, unknown>): stri
   return type === undefined || type === "Chat" ? message.text : "";
 }
 
+/** The official client distinguishes this public-summary origin from code,
+ * search and other Progress messages. Never infer a summary from their text.
+ * Messages are snapshots: a known message ID replaces its earlier text, while
+ * identical anonymous snapshots share a key. This optional buffer cannot make
+ * an otherwise empty or failed turn succeed. */
+function collectPublicReasoningSummary(summaries: Map<string, string>, message: Record<string, unknown>): void {
+  if (
+    message.author !== "bot"
+    || message.messageType !== "Progress"
+    || message.contentOrigin !== "ChainOfThoughtSummary"
+    || typeof message.text !== "string"
+    || ["Code", "SearchResults", "GeneratedImage", "BrowserSearch", "ToolCall", "GraphicArt"].includes(String(message.contentType ?? ""))
+  ) return;
+  const text = message.text;
+  const id = typeof message.messageId === "string" && message.messageId.length > 0 && message.messageId.length <= 256
+    ? message.messageId
+    : undefined;
+  const key = id === undefined ? `text:${text}` : `id:${id}`;
+  const previous = summaries.get(key);
+  if (previous === text) return;
+  const total = [...summaries.values()].reduce((sum, part) => sum + part.length, 0) - (previous?.length ?? 0) + text.length;
+  if (
+    !text.trim()
+    || total > MAX_PUBLIC_REASONING_SUMMARY_CHARACTERS
+    || (previous === undefined && summaries.size >= MAX_PUBLIC_REASONING_SUMMARY_PARTS)
+  ) {
+    // Do not expose an obsolete snapshot if its replacement cannot be kept.
+    summaries.delete(key);
+    return;
+  }
+  summaries.set(key, text);
+}
+
 /** A type:2 completion result is the authoritative answer snapshot. Keep the
  * older chooseChatHubText helper for compatibility callers, but runtime
  * completion must never concatenate or prefer an incompatible update stream.
@@ -1781,6 +1900,7 @@ async function runChatHub(
   emit?: (delta: string) => void,
   relay?: ChatHubRelay,
   onSemanticProgress?: () => void,
+  uploadedImages: ReadonlyArray<UploadedConversationImage> = [],
 ): Promise<ChatHubResult> {
   if (request.signal?.aborted) throw new Error("REQUEST_ABORTED");
   // This is deliberately outside the WebSocket fetch try/catch. A protocol
@@ -1794,9 +1914,9 @@ async function runChatHub(
   const unknownTargets = new Set<string>();
   let response: Response;
   const connection = relay
-    ? await relayWebSocketRequest(account, request.sessionId, request.conversationId, requestId, relay)
+    ? await relayWebSocketRequest(account, request.sessionId, request.conversationId, requestId, relay, uploadedImages.length > 0)
     : {
-        url: webSocketURL(account, request.sessionId, request.conversationId, requestId),
+        url: webSocketURL(account, request.sessionId, request.conversationId, requestId, uploadedImages.length > 0),
         headers: new Headers({
           Upgrade: "websocket",
           Origin: "https://m365.cloud.microsoft",
@@ -1842,7 +1962,7 @@ async function runChatHub(
     ping = setInterval(() => {
       try { socket.send(`{"type":6}${RS}`); } catch { /* read side reports closure */ }
     }, 15_000);
-    socket.send(buildChatPayload(request, requestId, attachments));
+    socket.send(buildChatPayload(request, requestId, attachments, uploadedImages));
     invocationSubmitted = true;
 
     let streamed = "";
@@ -1854,6 +1974,7 @@ async function runChatHub(
     let functionCall: FunctionCall | null = null;
     let malformedFunctionCall = false;
     let images: string[] = [];
+    const publicReasoningSummaries = new Map<string, string>();
     const completeResult = (): ChatHubResult => {
       const reconciliation = reconcileChatHubText(streamed, final);
       if (reconciliation.divergent) {
@@ -1905,6 +2026,7 @@ async function runChatHub(
       }
       return {
         text,
+        ...(publicReasoningSummaries.size > 0 ? { publicReasoningSummary: [...new Set(publicReasoningSummaries.values())] } : {}),
         conversationId: request.conversationId,
         sessionId: request.sessionId,
         requestId,
@@ -1992,6 +2114,7 @@ async function runChatHub(
               assertBoundedPayload("CHAT_OUTPUT_TOO_LARGE", streamed.length, MAX_OUTPUT_CHARACTERS, "streamed_text");
             }
             for (const message of messages) {
+              collectPublicReasoningSummary(publicReasoningSummaries, message);
               const answerText = chatHubAnswerMessageText(message);
               if (answerText) {
                 assertBoundedPayload("CHAT_OUTPUT_TOO_LARGE", answerText.length, MAX_OUTPUT_CHARACTERS, "update_snapshot");
@@ -2020,6 +2143,7 @@ async function runChatHub(
             : [];
           if (finalMessages.some((message) => message.messageType === "Disengaged")) disengaged = true;
           for (const message of finalMessages) {
+            collectPublicReasoningSummary(publicReasoningSummaries, message);
             const answerText = chatHubAnswerMessageText(message);
             if (answerText) {
               assertBoundedPayload("CHAT_OUTPUT_TOO_LARGE", answerText.length, MAX_OUTPUT_CHARACTERS, "completion_snapshot");
@@ -2042,6 +2166,13 @@ async function runChatHub(
               if (resultError === "unknown") resultError = "";
             } catch { /* opaque successful value */ }
           }
+          // Microsoft emits type:2 as the final stream item. The official web
+          // client treats it as terminal after harvesting its authoritative
+          // answer; a separate type:3 often follows but is not guaranteed on
+          // every rollout. Waiting for that optional frame leaves callers stuck
+          // after the complete answer is already visible.
+          if (resultError) throw new Error(`CHAT_UPSTREAM_ERROR:${resultError}`);
+          if (streamed || final || functionCall || images.length > 0) return completeResult();
           continue;
         }
         if (type === 3) {
@@ -2107,7 +2238,7 @@ export async function chatHub(
   const boundedRequest = { ...request, deadlineAt, signal };
   // Upload once before transport retries. A failed upload never falls through
   // to a text-only invocation. Nothing changes for requests without images.
-  await uploadConversationImages(account, request.conversationId, request.attachments, signal);
+  const uploadedImages = await uploadConversationImages(account, request.conversationId, request.attachments, signal);
   let attemptRequest = request.attachments?.length ? { ...boundedRequest, attachments: [] } : boundedRequest;
   let invocationSubmitted = false;
   // One bounded reconnect is allowed only before any semantic delta. A
@@ -2126,7 +2257,7 @@ export async function chatHub(
         : undefined;
       return await runChatHub(account, attemptRequest, deltaEmitter, relay, () => {
         semanticStarted = true;
-      });
+      }, uploadedImages);
     } catch (cause) {
       invocationSubmitted ||= cause instanceof ChatHubAttemptError && cause.invocationSubmitted;
       const historicalCause = preserveChatHubSubmissionHistory(cause, invocationSubmitted);

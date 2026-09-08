@@ -18,7 +18,6 @@ const MAX_TOTAL_DATA_IMAGE_BYTES = 6 * 1_024 * 1_024;
 // scan several megabytes of attacker-controlled text.
 const MAX_DATA_IMAGE_BASE64_CHARACTERS = Math.ceil(MAX_DATA_IMAGE_BYTES / 3) * 4;
 const MAX_DATA_IMAGE_URI_CHARACTERS = MAX_DATA_IMAGE_BASE64_CHARACTERS + 128;
-const MAX_IMAGE_PROMPT_CHARACTERS = 16_384;
 
 const DATA_IMAGE_TYPES = new Set([
   "image/gif",
@@ -27,12 +26,6 @@ const DATA_IMAGE_TYPES = new Set([
   "image/webp",
 ]);
 
-const IMAGE_GENERATION_SIZES = new Set([
-  "auto",
-  "1024x1024",
-  "1024x1792",
-  "1792x1024",
-]);
 
 export type MultimodalInputErrorCode =
   | "audio_not_supported"
@@ -70,12 +63,6 @@ export interface NormalizedMultimodalContents {
   dataImageBytes: number;
 }
 
-export interface NormalizedImageGenerationRequest {
-  prompt: string;
-  n: number;
-  size: "auto" | "1024x1024" | "1024x1792" | "1792x1024";
-  responseFormat: "url" | "b64_json";
-}
 
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -235,26 +222,6 @@ export function normalizeMultimodalContents(values: readonly unknown[]): Normali
     attachments.push(...normalized.attachments);
   }
   return { contents, attachments, dataImageBytes };
-}
-
-/** Validate the OpenAI Images generations request shape before account access. */
-export function normalizeImageGenerationRequest(value: unknown): NormalizedImageGenerationRequest {
-  const input = record(value);
-  if (!input) throw new MultimodalInputError("invalid_multimodal_content");
-  const prompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
-  if (!prompt || prompt.length > MAX_IMAGE_PROMPT_CHARACTERS) throw new MultimodalInputError("invalid_multimodal_content");
-  const n = input.n == null ? 1 : input.n;
-  if (!Number.isInteger(n) || Number(n) < 1 || Number(n) > 4) throw new MultimodalInputError("invalid_multimodal_content");
-  const size = input.size == null || input.size === "" ? "auto" : input.size;
-  if (typeof size !== "string" || !IMAGE_GENERATION_SIZES.has(size)) throw new MultimodalInputError("invalid_multimodal_content");
-  const responseFormat = input.response_format == null || input.response_format === "" ? "url" : input.response_format;
-  if (responseFormat !== "url" && responseFormat !== "b64_json") throw new MultimodalInputError("invalid_multimodal_content");
-  return {
-    prompt,
-    n: Number(n),
-    size: size as NormalizedImageGenerationRequest["size"],
-    responseFormat,
-  };
 }
 
 function probableImageURL(value: string): boolean {

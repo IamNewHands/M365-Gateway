@@ -31,12 +31,12 @@ import {
   type ToolLedgerSnapshotEntry,
 } from "./tool-ledger";
 import { validateToolArguments } from "./tool-schema";
+import { appendPublicReasoning, publicReasoningEvents, requestsPublicReasoning } from "./public-reasoning";
 import { createUpstreamGateLifecycle, type UpstreamGateLifecycle } from "./upstream-lifecycle";
 import { MAX_AI_REQUEST_BYTES, MAX_RESPONSES_REQUEST_BYTES, readJSONLimited } from "./request-body";
 import type { RequestMetricTracker } from "./request-metrics";
 import {
   MultimodalInputError,
-  normalizeImageGenerationRequest,
   normalizeMultimodalContent,
   normalizeMultimodalContents,
   type NormalizedImageAttachment,
@@ -686,7 +686,7 @@ export function compactCodeModeDescription(description: string): string {
       "CODE MODE CONTRACT (compact form): use the live caller `tools` object and choose functions from the request and returned evidence; no fixed sequence is implied.",
       "Each selector below is a caller-runtime JavaScript function. Use its declared argument keys and standard JSON values; a nested function name is never a shell command. Use the native structured channel, preserve exact JSON/command/path/text bytes, and return tool results through the caller runtime. A coherent multi-file change may be grouped into one execution call followed by one authoritative verifier; do not spend separate model turns on redundant read-backs already covered by it.",
       "EXECUTION SEMANTICS: the `functions.exec` input is raw JavaScript evaluated in a fresh V8 isolate as an async module. Top-level `await` is valid. A top-level `return` is a SyntaxError and MUST NOT be emitted; use `exit()` to finish early or let the script reach its end. `return` is allowed only inside a nested function or callback.",
-       "COMMAND INTEGRITY: Preserve command, path, and text bytes exactly. For Windows/PowerShell, avoid `::` static-member syntax when an ordinary cmdlet or literal works; never emit a bare colon member such as `:UtcNow`, `:Concat`, or `:NewLine`. If static syntax is unavoidable, preserve its complete type-qualified form and verify it is unchanged. Avoid nested `powershell -Command`/shell wrappers, here-strings, and mixed quote layers when a direct command suffices. When an SSH task needs a remote script with quotes, variables, templates, or multiple commands, open a retained interactive SSH session and send the remote script through `write_stdin`; do not embed the remote script inside a local JavaScript/PowerShell/SSH command string. If a command fails to parse, transport, or execute, do not repeat the same command or arguments; choose one materially different, minimal command and report the exact failure.",
+      "COMMAND INTEGRITY: Preserve command, path, and text bytes exactly. Treat the caller's declared shell/shell_type and the latest successful tool result as authoritative; never translate Bash, PowerShell, cmd.exe, or remote SSH in transit. For Windows/PowerShell, use native Get-ChildItem/Get-Content/Test-Path/Set-Content and semicolons; do not send POSIX find/grep/pwd, Bash &&, or <<EOF heredocs. For Bash/WSL, use POSIX syntax and do not send PowerShell cmdlets. avoid `::` static-member syntax when an ordinary cmdlet or literal works; never emit a bare colon member such as `:UtcNow`, `:Concat`, or `:NewLine`. If static syntax is unavoidable, preserve its complete type-qualified form and verify it is unchanged. Avoid nested `powershell -Command`/shell wrappers, here-strings, and mixed quote layers when a direct command suffices. When an SSH task needs a remote script with quotes, variables, templates, or multiple commands, open a retained interactive SSH session and send the remote script through `write_stdin`; do not embed the remote script inside a local JavaScript/PowerShell/SSH command string. If the shell is unknown, run one short read-only identity check before a long build. If a command fails to parse, transport, or execute, do not repeat the same command or arguments; choose one materially different command in the reported shell and report the exact failure.",
       "Send the source directly: do not wrap it in JSON, Markdown fences, a shell command, or an invented function/IIFE. Invoke nested capabilities as `await tools.<selector>(args)` with the exact declared object shape. A program may make multiple semantically necessary calls in one cell; there is no fixed call count or workflow. Use `text(...)`, `image(...)`, or `audio(...)` for results and `yield_control()` when a long run needs an intermediate update.",
     ];
     for (const entry of entries) {
@@ -1234,7 +1234,9 @@ export function repairFunctionCallTaskAnchors(
   call: FunctionCall,
   taskAnchors: ReadonlyArray<TaskAnchor> = [],
 ): FunctionCall {
-  if (taskAnchors.length === 0) return call;
+  // Only the parser knows whether these arguments came from the old encoded
+  // fallback. A native path ending in a legitimate X is not transport damage.
+  if (call.argumentEncoding !== "legacy_azhex" || taskAnchors.length === 0) return call;
   try {
     const visit = (value: unknown): unknown => {
       if (typeof value === "string") return repairTaskAnchorArtifacts(value, taskAnchors);
@@ -1300,7 +1302,12 @@ export function publicFailure(cause: unknown): { code: string; message: string }
   if (multimodal) return { code: multimodal.code, message: multimodal.message };
   const raw = cause instanceof Error ? cause.message : "";
   if (raw === "IMAGE_UPLOAD_INLINE_REQUIRED") return { code: "image_upload_inline_required", message: "this upstream requires inline base64 images; remote image URLs were not fetched or silently omitted" };
-  if (/^IMAGE_UPLOAD_(?:HTTP_\d{3}|UNAVAILABLE|INVALID_RESPONSE|NOT_BOUND)$/u.test(raw)) return { code: "image_upload_failed", message: "Microsoft 365 did not confirm image upload and conversation binding; no image question was sent" };
+  if (raw === "IMAGE_UPLOAD_HTTP_401" || raw === "IMAGE_UPLOAD_HTTP_403") return { code: "image_upload_failed", message: `Microsoft 365 rejected the image upload (HTTP ${raw.slice(-3)}); no image question was sent` };
+  if (raw === "IMAGE_UPLOAD_HTTP_429") return { code: "image_upload_failed", message: "Microsoft 365 rate-limited the image upload (HTTP 429); no image question was sent" };
+  if (/^IMAGE_UPLOAD_HTTP_\d{3}$/u.test(raw)) return { code: "image_upload_failed", message: `Microsoft 365 image upload returned HTTP ${raw.slice(-3)}; no image question was sent` };
+  if (raw === "IMAGE_UPLOAD_UNAVAILABLE") return { code: "image_upload_failed", message: "Microsoft 365 image upload could not be reached or timed out; no image question was sent" };
+  if (raw === "IMAGE_UPLOAD_INVALID_RESPONSE") return { code: "image_upload_failed", message: "Microsoft 365 image upload returned an invalid or oversized response; no image question was sent" };
+  if (raw === "IMAGE_UPLOAD_NOT_BOUND") return { code: "image_upload_failed", message: "Microsoft 365 did not confirm image upload and conversation binding; no image question was sent" };
   // Keep gateway invariant failures diagnosable without reflecting arbitrary
   // upstream text. Only gateway-authored machine codes are allow-listed, so
   // URLs, query parameters, credentials and Microsoft response text remain
@@ -1405,9 +1412,14 @@ export function escapePromptProtocolText(value: string): string {
   );
 }
 
-const IMAGE_CONTEXT_PLACEHOLDER = "[IMAGE ATTACHMENTS: binary data and URLs omitted from persistent conversation context]";
+const IMAGE_CONTEXT_PLACEHOLDER = "[IMAGE ATTACHMENTS PRESENT]";
 
 export interface PreparedMultimodalInput<T> {
+  /** Text-only value used for the live invocation. Image bytes travel through
+   * UploadFile, so an omission marker here would incorrectly tell the model
+   * that the separately bound image is unavailable. */
+  inferenceValue: T;
+  /** Redacted value suitable for ledgers and durable continuation state. */
   value: T;
   attachments: NormalizedImageAttachment[];
 }
@@ -1429,6 +1441,10 @@ export function prepareChatMultimodal(
   messages: Array<Record<string, unknown>>,
 ): PreparedMultimodalInput<Array<Record<string, unknown>>> {
   const normalized = normalizeMultimodalContents(messages.map((message) => message.content ?? ""));
+  const inferenceValue = messages.map((message, index) => ({
+    ...message,
+    content: normalized.contents[index].text.trim(),
+  }));
   const value = messages.map((message, index) => {
     const content = normalized.contents[index];
     if (content.attachments.length > 0 && String(message.role ?? "user").toLowerCase() !== "user") {
@@ -1436,14 +1452,14 @@ export function prepareChatMultimodal(
     }
     return { ...message, content: persistentContent(content) };
   });
-  return { value, attachments: normalized.attachments };
+  return { inferenceValue, value, attachments: normalized.attachments };
 }
 
 /** Responses also permits typed images in function_call_output. The caller's
  * call_id is validated separately; a tool result stays tool evidence, never a
  * new user instruction. Media bytes are passed only to the upload adapter. */
 export function prepareResponsesMultimodal(input: unknown): PreparedMultimodalInput<unknown> {
-  if (typeof input === "string") return { value: input, attachments: [] };
+  if (typeof input === "string") return { inferenceValue: input, value: input, attachments: [] };
   if (!Array.isArray(input)) throw new MultimodalInputError("invalid_multimodal_content");
 
   const targets: Array<{ index: number; field: "content" | "output" | "part"; role: string; value: unknown }> = [];
@@ -1466,6 +1482,7 @@ export function prepareResponsesMultimodal(input: unknown): PreparedMultimodalIn
 
   const normalized = normalizeMultimodalContents(targets.map((target) => target.value));
   const value = input.map((raw) => ({ ...(raw as Record<string, unknown>) }));
+  const inferenceValue = input.map((raw) => ({ ...(raw as Record<string, unknown>) }));
   for (let targetIndex = 0; targetIndex < targets.length; targetIndex += 1) {
     const target = targets[targetIndex];
     const content = normalized.contents[targetIndex];
@@ -1475,8 +1492,11 @@ export function prepareResponsesMultimodal(input: unknown): PreparedMultimodalIn
     const safe = persistentContent(content);
     if (target.field === "part") value[target.index] = { type: "input_text", text: safe };
     else value[target.index][target.field] = safe;
+    const inferenceText = content.text.trim();
+    if (target.field === "part") inferenceValue[target.index] = { type: "input_text", text: inferenceText };
+    else inferenceValue[target.index][target.field] = inferenceText;
   }
-  return { value, attachments: normalized.attachments };
+  return { inferenceValue, value, attachments: normalized.attachments };
 }
 
 interface PromptUnit<T> {
@@ -1651,6 +1671,10 @@ export function latestPairedFunctionOutputCallId(input: unknown): string {
   let latest = "";
   for (let index = 0; index < input.length; index += 1) {
     const item = input[index] as Record<string, unknown>;
+    // A later user turn ends the inferred tool-result continuation. Retain
+    // call identities so an outstanding result arriving after a clarification
+    // can still correlate; explicit lease.pendingCallId selection is separate.
+    if (String(item?.role ?? "").toLowerCase() === "user") latest = "";
     const callId = typeof item?.call_id === "string" ? item.call_id.trim() : "";
     if (!callId) continue;
     if (item.type === "function_call") calls.set(callId, index);
@@ -2490,7 +2514,11 @@ export async function acquireUpstreamGate(
   deadlineAt: number,
 ): Promise<{ accountId: string; leaseId: string }> {
   const state = env.TENANTS.getByName(env.TENANT_NAME || "default");
-  const deadline = Math.min(Date.now() + 120_000, deadlineAt);
+  // The logical request deadline is already bounded and streaming callers
+  // receive heartbeats while this queue is pending. A separate two-minute
+  // cutoff caused healthy long tasks to fail with account_busy even though
+  // their request still had time to reach the FIFO head.
+  const deadline = deadlineAt;
   const waiterId = `waiter-${crypto.randomUUID()}`;
   let acquired = false;
   let pollCount = 0;
@@ -2508,8 +2536,7 @@ export async function acquireUpstreamGate(
       pollCount += 1;
       await abortableDelay(retryDelay, signal);
     }
-    if (Date.now() >= deadlineAt) throw new Error("CHAT_DEADLINE_EXCEEDED");
-    throw new Error("ACCOUNT_QUEUE_TIMEOUT");
+    throw new Error("CHAT_DEADLINE_EXCEEDED");
   } finally {
     // Cancelled and timed-out requests must not remain at the head of the
     // strongly ordered queue. Successful acquisition removes the waiter in the
@@ -2601,6 +2628,13 @@ async function compactCredentialHash(request: Request): Promise<string> {
   return sha256(`m365-compact-credential\u0000${apiCredential(request)}`);
 }
 
+function compactionEncryptionKeys(
+  env: Pick<Env, "DATA_ENCRYPTION_KEY" | "COMPACTION_ENCRYPTION_KEY">,
+): string[] {
+  const preferred = env.COMPACTION_ENCRYPTION_KEY?.trim();
+  return [...new Set([preferred, env.DATA_ENCRYPTION_KEY.trim()].filter((key): key is string => Boolean(key)))];
+}
+
 /** Recover the exact Durable Object session hidden in a compaction item.
  * The credential binding prevents a copied capsule from crossing API keys. */
 function boundedCompactString(value: unknown, maximumBytes: number): string | null {
@@ -2647,20 +2681,27 @@ function validatedCompactCheckpoint(value: unknown): ChatCompactionCheckpoint | 
 async function compactSessionState(
   request: Request,
   input: unknown,
-  encryptionKey: string | undefined,
+  encryptionKeys: string | readonly string[] | undefined,
 ): Promise<RecoveredCompactSession | null> {
   const capsules = compactCapsules(input);
-  if (!encryptionKey || capsules.length === 0) return null;
+  const keys = (Array.isArray(encryptionKeys) ? encryptionKeys : [encryptionKeys])
+    .filter((key): key is string => typeof key === "string" && Boolean(key.trim()));
+  if (keys.length === 0 || capsules.length === 0) return null;
   const expectedCredential = await compactCredentialHash(request);
   let recovered = "";
   let checkpoint: ChatCompactionCheckpoint | null = null;
   for (const encrypted of capsules) {
-    let capsule: CompactSessionCapsule;
-    try {
-      capsule = await decryptJSON<CompactSessionCapsule>(encrypted, encryptionKey);
-    } catch {
-      throw new Error("INVALID_COMPACTION_CAPSULE");
+    let capsule: CompactSessionCapsule | null = null;
+    for (const key of keys) {
+      try {
+        capsule = await decryptJSON<CompactSessionCapsule>(encrypted, key);
+        break;
+      } catch {
+        // A capsule may have been issued before a shared compaction key was
+        // configured, or by another gateway that already uses that key.
+      }
     }
+    if (!capsule) throw new Error("INVALID_COMPACTION_CAPSULE");
     const now = Date.now();
     if (![COMPACT_CAPSULE_LEGACY_VERSION, COMPACT_CAPSULE_VERSION].includes(capsule?.version)
       || typeof capsule.sessionKey !== "string"
@@ -2685,9 +2726,9 @@ async function compactSessionState(
 async function compactSessionKey(
   request: Request,
   input: unknown,
-  encryptionKey: string | undefined,
+  encryptionKeys: string | readonly string[] | undefined,
 ): Promise<string | null> {
-  return (await compactSessionState(request, input, encryptionKey))?.sessionKey ?? null;
+  return (await compactSessionState(request, input, encryptionKeys))?.sessionKey ?? null;
 }
 
 async function scopedOpaqueKey(request: Request, namespace: string, candidate: string): Promise<string> {
@@ -2714,10 +2755,10 @@ export async function chatSessionKey(
 export async function responsesSessionKey(
   request: Request,
   bodyValue: ResponsesBody,
-  encryptionKey?: string,
+  encryptionKeys?: string | readonly string[],
 ): Promise<string> {
   if (bodyValue.new_conversation) return `responses:${crypto.randomUUID()}`;
-  const compacted = await compactSessionKey(request, bodyValue.input, encryptionKey);
+  const compacted = await compactSessionKey(request, bodyValue.input, encryptionKeys);
   if (compacted) return compacted;
   const previous = optionalSessionIdentifier(bodyValue.previous_response_id);
   if (previous) return scopedOpaqueKey(request, `m365-response-id-${CLIENT_TOOL_PROTOCOL_GENERATION}`, previous);
@@ -3474,6 +3515,7 @@ RULES:
   - The bridge accepts one call per turn. If multiple actions are possible, choose the most useful next action from the meaning and evidence; do not assume an order or a fixed number of steps.
 - A call that already has completed evidence must not be repeated.
 - Preserve the caller's exact data. Do not invent paths, credentials, command text, or a substitute hosted environment; if a schema or result is insufficient, choose a different declared action or return NO_TOOL_REQUIRED only when that is semantically correct.
+- SHELL COMPATIBILITY: use the selected tool's declared shell and prior result; never mix Bash/POSIX syntax with PowerShell or replay a parser-failed payload. Preserve command and shell fields exactly, and choose new syntax in the reported shell after failure.
 - Local patch/diff/edit programs are disabled. Never select or generate apply_patch, patch, git apply, diff, or an equivalent patch operation; use direct bounded writes or exec_command and verify the result. When several files form one coherent change, prefer one safe execution call followed by one authoritative verifier over redundant per-file model turns.
 - Do not emit commentary, an answer, or a hypothetical tool call.
 
@@ -3505,11 +3547,21 @@ export function parseToolRouterDecision(
   if (/^NO_TOOL_REQUIRED[.!]?$/iu.test(candidate)) {
     return { valid: !toolRequired(choice), call: null };
   }
+  const tagged = /^<tool_call\b[^>]*>\s*([\s\S]*?)\s*<\/tool_call>$/iu.exec(candidate);
+  if (tagged) candidate = tagged[1].trim();
   const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/iu.exec(candidate);
   if (fenced) candidate = fenced[1].trim();
+  // Isolated M365 router variants occasionally serialize the complete JSON
+  // envelope as a JSON string or append one harmless statement terminator.
+  // Decode at most one layer and never search arbitrary surrounding prose.
+  if (/;$/.test(candidate)) candidate = candidate.replace(/;\s*$/u, "").trim();
   let parsed: unknown;
   try {
     parsed = JSON.parse(candidate);
+    if (typeof parsed === "string" && parsed.length <= 1_000_000) {
+      candidate = parsed.trim();
+      parsed = JSON.parse(candidate);
+    }
   } catch {
     // Some upstream variants wrap the otherwise exact router object in one
     // JSON fence plus a short preface. Accept only one unambiguous fence; do
@@ -3521,7 +3573,7 @@ export function parseToolRouterDecision(
     if (fenceOffset < 0) return { valid: false, call: null };
     const outsideFence = `${candidate.slice(0, fenceOffset)} ${candidate.slice(fenceOffset + fencedCandidate[0].length)}`.trim();
     const boundedBoilerplate = outsideFence.length <= 160
-      && /^(?:|selected caller tool|selected tool|router decision|tool decision|here (?:is|'s) (?:the )?(?:json|decision|tool call))\s*[:.]?$/iu.test(outsideFence);
+      && /^(?:|selected caller tool|selected tool|router decision|tool decision|here (?:is|'s) (?:the )?(?:json|decision|tool call)|(?:已选择的?)?(?:客户端)?工具(?:调用|决策)?|路由(?:决策|结果))\s*[:：.]?$/iu.test(outsideFence);
     if (!boundedBoilerplate) return { valid: false, call: null };
     candidate = fencedCandidate[1].trim();
     try { parsed = JSON.parse(candidate); } catch { return { valid: false, call: null }; }
@@ -3590,10 +3642,11 @@ export function parseToolRouterDecision(
     return { valid: false, call: null };
   }
   if (calls.length === 0) return { valid: !toolRequired(choice), call: null };
-  // The Workers bridge deliberately executes one safe call at a time. A model
-  // returning several calls is not silently truncated because that would lose
-  // call identities and make later tool results impossible to reconcile.
-  if (calls.length !== 1) return { valid: false, call: null };
+  // This is an isolated router proposal, not a public tool-call response, so
+  // no call IDs have been issued yet. If a model proposes several sequential
+  // actions, publish only the first schema-valid call and re-evaluate after
+  // its structured result. That preserves the one-call bridge without turning
+  // a recoverable formatting mistake into a terminal 502.
   const call = boundPublicExecFunctionCall(parseFunctionCall(candidate, tools, explicit, true));
   if (!call || !names.includes(call.name)) {
     return { valid: false, call: null };
@@ -3640,6 +3693,8 @@ async function routerExchange(
   signal: AbortSignal | undefined,
   gateLifecycle: UpstreamGateLifecycle | undefined,
   deadlineAt: number,
+  nativeTools?: unknown[],
+  nativeToolChoice: unknown = "none",
 ): Promise<ChatHubResult> {
   const state = env.TENANTS.getByName(env.TENANT_NAME || "default");
   let gate: { accountId: string; leaseId: string } | undefined;
@@ -3657,13 +3712,12 @@ async function routerExchange(
       ...coordinates,
       started: true,
       tone,
-      // The router is a JSON formatter, not another tool-using assistant.
-      // Supplying native plugins here wrapped its exact-output instruction in
-      // a conflicting tool protocol and caused repeated invalid_text_decision
-      // failures.  Schemas and opaque names are already embedded in
-      // toolRouterPrompt(); the result is validated before any call is used.
-      tools: undefined,
-      toolChoice: "none",
+      // Normal repair passes are JSON formatters with schemas embedded in the
+      // prompt. A final fallback may instead use the isolated native plugin
+      // channel, which avoids depending on exact textual JSON formatting.
+      tools: nativeTools,
+      toolChoice: nativeTools?.length ? nativeToolChoice : "none",
+      ...(nativeTools?.length ? { messageProfile: "router" as const } : {}),
       signal,
       deadlineAt,
     }, accountChatHubRelay(env, account.egress));
@@ -3884,6 +3938,53 @@ async function resolveFunctionCall(
       namedRepair: false,
     }));
   }
+  // Exact JSON formatting is not uniformly reliable across M365 model
+  // variants. After two bounded text-router failures, make one isolated
+  // native-plugin decision. It still uses only caller-declared tools and the
+  // result passes the same schema, allow-list, repetition and round guards.
+  if (Date.now() < logicalDeadline) {
+    const nativeChoice = toolRequired(toolChoice) ? toolChoice : "auto";
+    const nativePrompt = `${originalPrompt}\n\nISOLATED NATIVE TOOL RECOVERY: Select at most one declared caller-side tool that safely advances the task. Do not repeat a completed action or invent arguments. If no tool is needed and auto mode permits it, answer the request directly.`;
+    try {
+      metrics?.observeInputText(nativePrompt);
+      const native = await routerExchange(
+        env,
+        account,
+        nativePrompt,
+        toolRouterTone(tone),
+        signal,
+        gateLifecycle,
+        logicalDeadline,
+        tools,
+        nativeChoice,
+      );
+      observeMetricResult(metrics, native);
+      const nativeCall = boundPublicExecFunctionCall(normalizeClientFunctionCall(native.functionCall, tools));
+      if (nativeCall && allowed.includes(nativeCall.name)) {
+        const guarded = await guardedFunctionCall(nativeCall, ledger, taskAnchors);
+        if (guarded.call) {
+          adoptToolRouterResult(initialResult, native);
+          return { kind: "call", call: guarded.call };
+        }
+        recoveryReason = guarded.rejection?.publicMessage ?? recoveryReason;
+        lastRouterFailureKind = `native_guard_${guarded.rejection?.publicCode ?? "rejected"}`;
+      } else if (native.toolDecision === "answer" && !toolRequired(nativeChoice)) {
+        adoptToolRouterResult(initialResult, native);
+        return { kind: "no_tool" };
+      } else {
+        lastRouterFailureKind = native.functionCall ? "invalid_native_recovery_call" : "invalid_native_recovery_decision";
+      }
+    } catch (cause) {
+      const code = cause instanceof Error ? cause.message : "";
+      if (signal?.aborted || code === "REQUEST_ABORTED" || code === "CHAT_DEADLINE_EXCEEDED") throw cause;
+      lastRouterFailureKind = `native_exchange_${internalFailureCode(cause).toLowerCase()}`;
+      console.error(JSON.stringify({
+        event: "tool_router_native_recovery_failed",
+        kind: lastRouterFailureKind,
+        declaredToolCount: names.length,
+      }));
+    }
+  }
   if (!recoveryReason) {
     const deterministic = await deterministicToolRouterRecovery(
       originalPrompt,
@@ -3991,7 +4092,8 @@ function genericAssistantNonAnswer(text: string): boolean {
  * authority to choose another tool; callers must separately prove user intent. */
 export function isCallerLocalExecRefusal(input: FableLocalExecRefusalInput): boolean {
   if (String(input.toolChoice ?? "auto").toLowerCase() !== "auto") return false;
-  if (callerLocalToolNames(input.tools).length === 0) return false;
+  const localTools = callerLocalToolCandidates(input.tools);
+  if (localTools.length === 0) return false;
 
   const refusal = input.responseText.trim();
   // This exact apology is a model-family-independent non-answer. Treating it
@@ -4018,7 +4120,21 @@ export function isCallerLocalExecRefusal(input: FableLocalExecRefusalInput): boo
   ) || (
     /(?:请|需要)[\s\S]{0,40}(?:重新|再次)[\s\S]{0,40}(?:连接|接入)[\s\S]{0,60}(?:本地|客户端)?工具(?:运行时|环境)?/u.test(refusal)
   );
-  return genericNonAnswer || englishDeclaredToolAbsence || englishRefusal || chineseRefusal;
+  // Vision-capable clients expose local images through a caller-side tool.
+  // A model may nevertheless claim that it cannot see pixels or that image
+  // input is unsupported. Treat that answer as an availability contradiction
+  // only when the actual request declares a visual reader; an exec-only or
+  // text-only client must not be routed into an invented image operation.
+  const hasVisualReadTool = localTools.some((tool) => tool.capabilities.includes("visual_read"));
+  const visualRefusal = hasVisualReadTool && (
+    /(?:当前|这个|该)?(?:环境|会话|对话|回合)[\s\S]{0,64}(?:不支持|无法|不能)[\s\S]{0,48}(?:图片|图像|视觉)(?:输入|读取|识别|内容)?/u.test(refusal)
+      || /(?:无法|不能|没有|未能)[\s\S]{0,64}(?:实际)?(?:看到|读取|访问|获取|识别)[\s\S]{0,64}(?:图片|图像|截图|像素|画面)(?:内容)?/u.test(refusal)
+      || /(?:只|仅)[\s\S]{0,40}(?:收到|看到|获取到)[\s\S]{0,56}(?:图片)?(?:文件名|路径|占位(?:符|信息))/u.test(refusal)
+      || /\b(?:I|we)\s+(?:can(?:not|['’]t)|am unable to|are unable to|do not)\b[\s\S]{0,80}\b(?:see|read|access|view|inspect|analy[sz]e)\b[\s\S]{0,64}\b(?:the\s+)?(?:actual\s+)?(?:image|picture|screenshot|pixels?|visual(?:\s+content)?)\b/iu.test(refusal)
+      || /\b(?:current\s+)?(?:environment|session|conversation|chat|turn)\b[\s\S]{0,80}\b(?:does\s+not|doesn['’]t|cannot|can['’]t)\b[\s\S]{0,64}\bsupport\b[\s\S]{0,40}\b(?:image|visual)\s+input\b/iu.test(refusal)
+      || /\bonly\s+(?:received|have|got)\b[\s\S]{0,64}\b(?:file\s*name|path|placeholder)\b[\s\S]{0,64}\b(?:image|picture|screenshot|pixels?|visual)\b/iu.test(refusal)
+  );
+  return genericNonAnswer || englishDeclaredToolAbsence || englishRefusal || chineseRefusal || visualRefusal;
 }
 
 /** Detect any model's concrete claim that caller-local tools are absent even
@@ -4128,18 +4244,13 @@ export function shouldRestorePortableTaskFollowup(
 ): boolean {
   if (!lease.portableProtocolTail.trim() || prompt.startsWith(`${PORTABLE_HISTORY_MARKER}\n`)) return false;
   const request = callerLocalRecoveryUserRequest(prompt).trim();
-  if (!request || request.length > 240 || callerRequestedStopOnFailure(request)) return false;
-  if (/^(?:\s*(?:please\s+)?(?:explain|describe|tell me (?:how|why)|what|why|how (?:does|can|would)|status)\b|\s*(?:请)?(?:解释|说明|为什么|为何|如何|怎么回事|什么情况|状态|进度))/iu.test(request)) return false;
-
-  const normalized = request.replace(/[\s"'`“”‘’]+/gu, "");
-  const englishFollowup = /^(?:continue|goon|proceed|keepgoing|carryon|resume|retry|doit|start|run|execute|deploy|sync|fix|repair|test|verify|check|inspect|login|connect|push|package)(?:[.!?,，。！?？]*)$/iu.test(normalized)
-    || /\b(?:continue|proceed|keep\s+going|carry\s+on|resume|retry|do\s+it|go\s+do\s+it|start|run|execute|deploy|sync|fix|repair|test|verify|check|inspect|log\s+in|connect|push|package)\b/iu.test(request)
-      && request.length <= 96;
-  const chineseFollowup = /^(?:继续|接着|往下|推进|去做|做啊|开始|执行|运行|部署|同步|修复|测试|验证|检查|查看|登录|连接|推送|打包|处理|弄|搞)(?:一下|下去|下|吧|啊|了|好)?[，。！!？?]*$/u.test(normalized)
-    || /(?:你倒是|赶紧|快点|马上|直接|继续|接着)[^。！？\n]{0,40}(?:做|弄|搞|处理|推进|修|部署|同步|跑|测|查|验证|检查|执行|运行|登录|连接|打包|推送)/u.test(request)
-    || /(?:去|开始|继续|接着)[^。！？\n]{0,30}(?:做|弄|搞|处理|修|部署|同步|跑|测|查|验证|检查|执行|运行|登录|连接|打包|推送)/u.test(request);
-
-  return englishFollowup || chineseFollowup;
+  // Portable history is ordinary bounded dialogue state, not a command
+  // classifier. Any compact follow-up may depend on it: status questions,
+  // elliptical action requests, corrections and newly worded instructions
+  // all need the same preceding task. The requested model still decides from
+  // natural language whether to answer or call a declared tool. Restoring
+  // context here neither forces a tool nor grants new authority.
+  return Boolean(request) && request.length <= 2_000;
 }
 
 /** A fresh caller-local result deserves one independent semantic audit before
@@ -4189,12 +4300,13 @@ function shouldRunInitialCallerLocalAudit(input: {
   completionLedger: ToolLedger;
 }): boolean {
   if (!shouldAuditInitialCallerLocalDecision(input.prompt, input.tools, input.toolChoice)) return false;
-  // A caller-owned destination is a structural conversation fact, not a
-  // command keyword. Let the semantic router decide the action whenever the
-  // primary answer did not already emit a native call for that destination.
-  if (callerLocalDestinationRequest(input.prompt)) return true;
-  if (!callerLocalAnswerUsable(input.result, input.tone, input.toolChoice, input.tools, input.prompt)) return true;
-  return !evaluateCompletionEvidence(input.result.text, input.completionLedger).allowed;
+  // The primary model returned prose even though the caller exposed local
+  // tools and the user supplied a non-explanatory request. Do not decide from
+  // paths or a finite action-verb list whether that prose is terminal. The
+  // isolated auto router performs the semantic answer-vs-action decision from
+  // the unchanged natural-language task and declared schemas. It may still
+  // return NO_TOOL_REQUIRED for an answer-only request.
+  return true;
 }
 
 /** Restore only sanitized, bounded prior dialogue for an independent repair
@@ -4316,6 +4428,13 @@ export function assistantReportsIncompleteOutcome(text: string): boolean {
   return /(?:尚未|仍未|还未|并未|未能)[^。！？\n]{0,120}(?:完成|完毕|收尾|结束|执行|落实|验证|测试|部署|同步|提交|写入|修改|修复)|(?:还不能|尚不能|暂不能)[^。！？\n]{0,48}(?:完成|收尾|结束)|\b(?:still|not\s+yet|hasn['’]t|haven['’]t|remains?\s+to\s+be)[^.!?\n]{0,120}\b(?:complete|completed|done|finish(?:ed)?|deploy(?:ed)?|verify|verified|test(?:ed)?|submit(?:ted)?|write|written|fix(?:ed)?)\b/iu.test(prose);
 }
 
+/** Internal routing checkpoints are control-flow, never terminal assistant
+ * answers. Match both natural word orders because localized fallbacks place
+ * "preserved" before the task while older model echoes place it after. */
+function isRoutingCheckpointText(text: string): boolean {
+  return /(?:The (?:current )?task and (?:existing|latest) tool results? are preserved|The task state was preserved without executing an unverified or malformed tool action|Tool execution stopped after a repeated or invalid action|(?:当前任务|任务状态|已有工具结果|刚才的工具结果)[^。\n]{0,120}(?:已保留|都已保留)|(?:已保留|都已保留)[^。\n]{0,120}(?:当前任务|任务状态|已有工具结果|刚才的工具结果)|本轮没有需要再次执行的工具动作|没有重复已完成的调用)/iu.test(text);
+}
+
 function callerLocalAnswerUsable(
   result: ChatHubResult,
   tone: string,
@@ -4329,6 +4448,7 @@ function callerLocalAnswerUsable(
     || /^NO_TOOL_REQUIRED[.!]?$/iu.test(text)
     || text.startsWith(LEGACY_TOOL_RECOVERY_TERMINATION_PREFIX)
     || containsClientToolProtocolResidue(text)
+    || isRoutingCheckpointText(text)
     || /(?:The (?:current )?task and (?:existing|latest) tool results? are preserved|The task state was preserved without executing an unverified or malformed tool action|Tool execution stopped after a repeated or invalid action|(?:当前任务|任务状态|已有工具结果|刚才的工具结果)[^。\n]{0,100}(?:已保留|都已保留)|没有与该完成声明对应的成功工具证据|现有工具证据显示相关操作失败或未成功完成|工具结果的状态无法核验|当前仍有工具调用未返回)/iu.test(text)
     || (callerLocalMutationRequest(prompt) && unresolvedAssistantCommitment(text))) return false;
   return !isCallerLocalExecRefusal({ tone, toolChoice, tools, prompt, responseText: text });
@@ -4346,6 +4466,7 @@ function needsToolResultAnswerRepair(text: string): boolean {
     || value === CLIENT_TOOL_UNAVAILABLE_SENTINEL
     || /^NO_TOOL_REQUIRED[.!]?$/iu.test(value)
     || containsClientToolProtocolResidue(value)
+    || isRoutingCheckpointText(value)
     || genericAssistantNonAnswer(value)) return true;
   // Claude sometimes rejects the serialized continuation as if it were a
   // prompt-injection attempt (mentioning tool-call history or hidden
@@ -4640,6 +4761,7 @@ async function resolveDirectNativeTurn(
     if (!routingEnabled || !allowed.includes(candidate.name)) throw new Error("TOOL_DECISION_INVALID");
     const guarded = await guardedFunctionCall(candidate, ledger, taskAnchors);
     if (guarded.call) return { kind: "upstream", call: guarded.call, result };
+    if (guarded.rejection) throw guarded.rejection;
     throw new Error("TOOL_DECISION_INVALID");
   }
   if (!routingEnabled) return { kind: "upstream", call: null, result };
@@ -4727,10 +4849,32 @@ async function resolveAssistantTurn(
       );
       if (direct.call) return direct;
 
+      const initialSemanticAudit = routingEnabled
+        && ledger.completed.length === 0
+        && !isCallerLocalExecRefusal({
+          tone,
+          toolChoice: effectiveToolChoice,
+          tools,
+          prompt: callerLocalIntentPrompt,
+          responseText: result.text,
+          freshCallerLocalResult,
+        })
+        && shouldRunInitialCallerLocalAudit({
+          prompt: callerLocalIntentPrompt,
+          result,
+          tone,
+          toolChoice: effectiveToolChoice,
+          tools,
+          completionLedger,
+        });
+      const prematureContinuationCheckpoint = routingEnabled
+        && !callerRequestedNoImmediateAction(callerLocalIntentPrompt)
+        && isRoutingCheckpointText(result.text);
       if (routingEnabled && (
         unresolvedAssistantCommitment(result.text)
         || (assistantReportsIncompleteOutcome(result.text)
           && !callerRequestedNoImmediateAction(callerLocalIntentPrompt))
+        || prematureContinuationCheckpoint
       )) {
         // A promise is not a call and cannot advance a caller's agent loop.
         // Reconsider only this anomalous answer, with native tools on the SAME
@@ -4777,6 +4921,13 @@ ${callerLocalIntentPrompt}`;
           && next
           && reviewed.text.trim()
           && !unresolvedAssistantCommitment(reviewed.text)
+          && callerLocalAnswerUsable(
+            reviewed,
+            tone,
+            effectiveToolChoice,
+            tools,
+            callerLocalIntentPrompt,
+          )
           && evaluateCompletionEvidence(reviewed.text, completionLedger).allowed) {
           return next;
         }
@@ -4813,6 +4964,34 @@ ${callerLocalIntentPrompt}`;
         // the protocol must expose a real failure instead of a fake completed
         // checkpoint that strands the task.
         throw new Error("CONTINUATION_DECISION_INVALID");
+      }
+      if (initialSemanticAudit) {
+        const recoveryRoute = callerLocalRecoveryRoute(tools);
+        if (recoveryRoute) {
+          const audited = await resolveFunctionCall(
+            env,
+            account,
+            result,
+            `${callerLocalIntentPrompt}\n\nINITIAL CALLER-LOCAL TASK AUDIT: Decide semantically from the unchanged natural-language request whether a caller-side action is required. If it is, return one declared native tool call that advances the task. If the request is fully answerable now, return NO_TOOL_REQUIRED. Do not rely on a keyword list, invent a path, promise future work, or claim unverified execution.`,
+            tone,
+            recoveryRoute.tools,
+            "auto",
+            ledger,
+            signal,
+            gateLifecycle,
+            deadlineAt,
+            metrics,
+            lease.taskAnchors,
+          );
+          if (audited.kind === "call") return { kind: "upstream", call: audited.call, result };
+          if (audited.kind === "no_tool") return direct;
+          // The requested-model answer remains authoritative when an
+          // auxiliary semantic router is unavailable. Never turn a usable
+          // answer into a 502 merely because the optional audit disconnected
+          // or returned malformed formatting.
+          if (callerLocalAnswerUsable(result, tone, effectiveToolChoice, tools, callerLocalIntentPrompt)) return direct;
+          return checkpoint(audited);
+        }
       }
       // The direct-native fast path is still authoritative for every valid
       // call and ordinary answer.  A narrow exception is required when the
@@ -4857,6 +5036,51 @@ ${callerLocalIntentPrompt}`;
       if (recovered.kind === "call") return { kind: "upstream", call: recovered.call, result };
       return checkpoint(recovered);
     } catch (cause) {
+      const repeatedVisualRead = cause instanceof ToolLedgerBlockedError
+        && cause.publicCode === "repeated_tool_call"
+        && freshToolResult
+        && attachments.length > 0
+        && normalizeClientFunctionCall(result.functionCall, tools ?? [])?.name === "view_image";
+      if (repeatedVisualRead) {
+        // The image bytes were attached to the immediately preceding ChatHub
+        // invocation, but the model asked the caller to read the same path a
+        // second time (often changing only high/original). Keep the accepted
+        // image in the same upstream conversation and request a tool-less
+        // answer so the client cannot enter a view_image loop.
+        const answerLease: ChatLease = {
+          ...lease,
+          conversationId: result.conversationId,
+          sessionId: result.sessionId,
+          started: true,
+        };
+        const answered = await exchange(
+          env,
+          session,
+          answerLease,
+          account,
+          "FRESH IMAGE RESULT: The caller has already returned the requested image and its pixels are attached to the preceding turn. Answer the original user's question from that image now. Do not request another tool call, discuss tool availability, or ask the user to upload the image again.",
+          tone,
+          undefined,
+          "none",
+          undefined,
+          undefined,
+          signal,
+          gateLifecycle,
+          deadlineAt,
+          metrics,
+        );
+        observeMetricResult(metrics, answered);
+        if (answered.text.trim()
+          && callerLocalAnswerUsable(answered, tone, "none", undefined, callerLocalIntentPrompt)
+          && evaluateCompletionEvidence(answered.text, completionLedger).allowed) {
+          return { kind: "upstream", call: null, result: answered };
+        }
+        return checkpoint({
+          kind: "blocked",
+          code: "repeated_tool_call",
+          reason: "the image was returned successfully but the requested model did not produce a usable visual answer",
+        });
+      }
       if (!(cause instanceof Error) || cause.message !== "TOOL_DECISION_INVALID") throw cause;
       // Keep the normal production path as one direct model/tool exchange. If
       // Microsoft emits one malformed envelope or proposes an action rejected
@@ -5556,33 +5780,17 @@ function chatUsage(usage: APIUsage): { prompt_tokens: number; completion_tokens:
   return { prompt_tokens: usage.input_tokens, completion_tokens: usage.output_tokens, total_tokens: usage.total_tokens };
 }
 
-/** Last-mile guard for every public response shape. A native ChatHub event or
- * a persisted legacy turn must never be able to leak AZHEX punctuation to the
- * caller's local tool runtime. Known caller-tool aliases are normalized even
- * when the current serializer no longer has the original tool array. */
-const MAX_PUBLIC_EXEC_COMMAND_CHARACTERS = 2_400;
-const MAX_PUBLIC_EXEC_OUTPUT_TOKENS = 12_000;
-const MAX_PUBLIC_EXEC_YIELD_TIME_MS = 30_000;
-
-function broadRepositoryInspection(command: string): boolean {
-  // Preserve the model's semantic command plan. The gateway owns transport,
-  // schema and resource bounds; it must not reinterpret "analyse", "inspect"
-  // or a particular PowerShell verb as one hard-coded inventory command.
-  // Only an objectively oversized payload is replaced with a bounded first
-  // step so it cannot cross the local execution boundary as one giant script.
-  return command.length > MAX_PUBLIC_EXEC_COMMAND_CHARACTERS;
-}
-
 function boundedRepositoryCommand(workdir: string): string {
   if (!workdir) return "Get-ChildItem -Force | Select-Object -First 200 Name,FullName,Mode,Length,LastWriteTime";
   const safeWorkdir = workdir.replace(/'/gu, "''");
   return `Get-ChildItem -LiteralPath '${safeWorkdir}' -Force | Select-Object -First 200 Name,FullName,Mode,Length,LastWriteTime`;
 }
 
-/** Enforce a deterministic first step for broad local-repository analysis.
- * Prompt instructions are advisory; this boundary is what prevents a model
- * or an old persisted turn from sending a 500-file PowerShell pipeline to the
- * caller. The next turn can request focused files after seeing the inventory. */
+/** Public serialization may normalize a declared wire alias and validate its
+ * JSON, but must not substitute another command or change caller execution
+ * parameters. Local output/yield budgets belong to the caller's tool runtime,
+ * not the Cloudflare request budget. Keep the existing exported boundary name
+ * for compatibility; request/schema limits are enforced elsewhere. */
 export function boundPublicExecFunctionCall(call: FunctionCall | null | undefined): FunctionCall | null {
   if (!call) return null;
   const normalized = normalizeClientFunctionCall(call, []);
@@ -5595,29 +5803,7 @@ export function boundPublicExecFunctionCall(call: FunctionCall | null | undefine
     if (sensitiveName) return null;
     return call;
   }
-  if (normalized.name !== "exec_command") return normalized;
-  let parsed: Record<string, unknown>;
-  try {
-    const value = JSON.parse(normalized.arguments) as unknown;
-    if (!value || typeof value !== "object" || Array.isArray(value)) return normalized;
-    parsed = { ...(value as Record<string, unknown>) };
-  } catch {
-    return normalized;
-  }
-  if (typeof parsed.cmd !== "string") return normalized;
-  const workdir = typeof parsed.workdir === "string" && parsed.workdir.trim()
-    ? parsed.workdir.trim()
-    : "";
-  if (broadRepositoryInspection(parsed.cmd)) {
-    parsed.cmd = boundedRepositoryCommand(workdir);
-  }
-  if (typeof parsed.max_output_tokens === "number" && Number.isFinite(parsed.max_output_tokens)) {
-    parsed.max_output_tokens = Math.min(Math.max(1, Math.trunc(parsed.max_output_tokens)), MAX_PUBLIC_EXEC_OUTPUT_TOKENS);
-  }
-  if (typeof parsed.yield_time_ms === "number" && Number.isFinite(parsed.yield_time_ms)) {
-    parsed.yield_time_ms = Math.min(Math.max(0, Math.trunc(parsed.yield_time_ms)), MAX_PUBLIC_EXEC_YIELD_TIME_MS);
-  }
-  return { name: "exec_command", arguments: JSON.stringify(parsed) };
+  return normalized;
 }
 
 function publicFunctionCall(call: FunctionCall | null | undefined): FunctionCall | null {
@@ -5883,7 +6069,7 @@ async function chatCompletions(request: Request, env: Env, metrics?: RequestMetr
     if (restoreCheckpointHistory) {
       rememberRestoredChatTrailingToolCompletion(ledger, incomingLedger, storedSnapshots);
     }
-    const promptValue = omitRecoveredPendingProposals(prepared.value, parsedLedger, ledger) as Array<Record<string, unknown>>;
+    const promptValue = omitRecoveredPendingProposals(prepared.inferenceValue, parsedLedger, ledger) as Array<Record<string, unknown>>;
     completionLedger = await parseChatCompletionEvidenceLedger(parsed.messages, storedSnapshots);
     recoveredRepeatedProposal = recoveredRepeatedPendingProposal(parsedLedger, ledger);
     const ledgerFailure = toolLedgerPreflight(ledger);
@@ -6091,6 +6277,65 @@ export function compactRetainedMessages(input: unknown): Array<Record<string, un
   return [...(additionalTools ? [additionalTools] : []), ...retained.reverse()];
 }
 
+function compactMessageText(item: Record<string, unknown>): string {
+  if (typeof item.content === "string") return item.content.trim();
+  if (!Array.isArray(item.content)) return "";
+  return item.content.flatMap((part) => {
+    if (!part || typeof part !== "object" || Array.isArray(part)) return [];
+    const content = part as Record<string, unknown>;
+    return ["text", "input_text", "output_text"].includes(String(content.type ?? ""))
+      && typeof content.text === "string"
+      ? [content.text]
+      : [];
+  }).join("\n").trim();
+}
+
+/** Convert the public text retained by a Responses compaction into complete,
+ * sanitized portable turns. This is the independent task-state copy used
+ * when a client later supplies only the compaction capsule plus a short
+ * follow-up. Tool payloads, media and developer instructions are excluded. */
+export function compactPortableTaskTail(input: unknown): string {
+  const retained = compactRetainedMessages(input);
+  let pendingUser = "";
+  let tail = "";
+  for (const item of retained) {
+    const role = String(item.role ?? "").toLowerCase();
+    const text = compactMessageText(item);
+    if (!text) continue;
+    if (role === "user") {
+      pendingUser = `[USER]\n${escapePromptProtocolText(text)}`;
+      continue;
+    }
+    if (role !== "assistant") continue;
+    // A generated compaction summary can be assistant-only. Give it a
+    // neutral data frame so portableTurnLooksComplete() can reject partial
+    // suffixes without treating the summary as a new user instruction.
+    const request = pendingUser || "[TURN]\nRetained client compaction state";
+    tail = appendPortableProtocolTurn(
+      tail,
+      request,
+      `[ASSISTANT]\n${escapePromptProtocolText(text)}`,
+    );
+    pendingUser = "";
+  }
+  return boundedPortableProtocolSuffix(tail, 64 * 1_024);
+}
+
+function mergePortableTaskTails(previous: string, incoming: string): string {
+  if (!incoming.trim()) return boundedPortableProtocolSuffix(previous, 64 * 1_024);
+  const seen = new Set(previous.split(PORTABLE_TURN_SEPARATOR)
+    .map((turn) => sanitizePortableProtocolText(turn))
+    .filter(portableTurnLooksComplete));
+  let merged = previous;
+  for (const raw of incoming.split(PORTABLE_TURN_SEPARATOR)) {
+    const turn = sanitizePortableProtocolText(raw);
+    if (!portableTurnLooksComplete(turn) || seen.has(turn)) continue;
+    merged = `${merged}${PORTABLE_TURN_SEPARATOR}${turn}`;
+    seen.add(turn);
+  }
+  return boundedPortableProtocolSuffix(merged, 64 * 1_024);
+}
+
 function compactJSONResponse(
   responseId: string,
   output: Array<Record<string, unknown>>,
@@ -6198,10 +6443,12 @@ async function inputCompactionCheckpoint(
         renderToolName: clientToolWireName,
       })
     : "";
+  const retainedTaskTail = compactPortableTaskTail(input);
+  const mergedTaskTail = mergePortableTaskTails(base?.portableProtocolTail ?? "", retainedTaskTail);
   const portableProtocolTail = boundedPortableProtocolSuffix(
     evidence
-      ? appendPortableProtocolTurn(base?.portableProtocolTail ?? "", "", evidence)
-      : base?.portableProtocolTail ?? "",
+      ? appendPortableProtocolTurn(mergedTaskTail, "", evidence)
+      : mergedTaskTail,
     64 * 1_024,
   );
   const currentToolsSnapshot = callerToolsSnapshot(tools);
@@ -6257,8 +6504,9 @@ async function responsesCompact(request: Request, env: Env): Promise<Response> {
   const compactTools = mergeRoutableResponsesTools(parsed.tools, parsed.input);
   const responseId = `resp_${crypto.randomUUID().replaceAll("-", "")}`;
   const compactId = `cmp_${crypto.randomUUID().replaceAll("-", "")}`;
-  const inherited = await compactSessionState(request, parsed.input, env.DATA_ENCRYPTION_KEY);
-  const sessionKey = inherited?.sessionKey ?? await responsesSessionKey(request, parsed, env.DATA_ENCRYPTION_KEY);
+  const encryptionKeys = compactionEncryptionKeys(env);
+  const inherited = await compactSessionState(request, parsed.input, encryptionKeys);
+  const sessionKey = inherited?.sessionKey ?? await responsesSessionKey(request, parsed, encryptionKeys);
   let durableCheckpoint: ChatCompactionCheckpoint | null = null;
   try {
     durableCheckpoint = await chatSession(env, sessionKey).compactionCheckpoint();
@@ -6281,7 +6529,7 @@ async function responsesCompact(request: Request, env: Env): Promise<Response> {
     issuedAt: now,
     expiresAt: now + COMPACT_CAPSULE_TTL_MS,
     checkpoint,
-  }, env.DATA_ENCRYPTION_KEY);
+  }, encryptionKeys[0]);
   const retained = compactRetainedMessages(parsed.input);
   const compactItem: Record<string, unknown> = {
     id: compactId,
@@ -6704,6 +6952,7 @@ function responsesStream(
   metrics?: RequestMetricTracker,
   freshToolResult = false,
   lifecycle?: ResponsesStreamLifecycle,
+  publicSummaryRequested = false,
 ): Response {
   const state = env.TENANTS.getByName(env.TENANT_NAME || "default");
   const cancellation = createStreamCancellation(state, session, lease, downstreamSignal);
@@ -6767,9 +7016,10 @@ function responsesStream(
           const { call, result } = turn;
           markCheckpointMetric(metrics, result);
           const safeCall = publicFunctionCall(call);
-          const output = safeCall
+          const businessOutput = safeCall
             ? responseOutput(responseId, result, safeCall, tools)
             : [{ id: messageId, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: assistantVisibleText(result), annotations: [] }] }];
+          const output = appendPublicReasoning(businessOutput, result.publicReasoningSummary, publicSummaryRequested);
           const item = output[0] as Record<string, unknown>;
            const functionEvents = safeCall ? responseFunctionCallEvents(item, safeCall) : [];
            const finalTail = appendPortableProtocolTurn(portableBaseTail, portableTurnPrompt, portableAssistantResult(result, safeCall));
@@ -6814,6 +7064,7 @@ function responsesStream(
           }
           if (safeCall) send(functionEvents.at(-1)!);
           else send({ type: "response.output_item.done", output_index: 0, item });
+          for (const event of publicReasoningEvents(output)) send(event);
           if (closed) {
             await terminalDelivery.cancel();
             return;
@@ -6915,8 +7166,9 @@ async function responsesCore(
   const instructionPrefix = responsesInstructionsPrefix(parsed.instructions);
   if (parsed.previous_response_id && parsed.conversation != null) throw new Error("INVALID_REQUEST");
   if (parsed.previous_response_id && parsed.new_conversation) throw new Error("INVALID_REQUEST");
-  const compactedSession = await compactSessionState(request, parsed.input, env.DATA_ENCRYPTION_KEY);
-  const key = compactedSession?.sessionKey ?? await responsesSessionKey(request, parsed, env.DATA_ENCRYPTION_KEY);
+  const encryptionKeys = compactionEncryptionKeys(env);
+  const compactedSession = await compactSessionState(request, parsed.input, encryptionKeys);
+  const key = compactedSession?.sessionKey ?? await responsesSessionKey(request, parsed, encryptionKeys);
   const responseSessionKey = await scopedOpaqueKey(request, `m365-response-id-${CLIENT_TOOL_PROTOCOL_GENERATION}`, responseId);
   const sourceSession = chatSession(env, key);
   let session: DurableObjectStub<ChatSession> = sourceSession;
@@ -6940,6 +7192,17 @@ async function responsesCore(
   // genuinely empty/new Durable Object; existing durable state remains the
   // authority and can never be rolled back by replaying an older capsule.
   hydrateLeaseFromCompaction(lease, compactedSession?.checkpoint);
+  const compactedPortableTail = compactedSession?.checkpoint?.portableProtocolTail ?? "";
+  const hasCompactedTaskContext = Boolean(compactedPortableTail.trim());
+  if (hasCompactedTaskContext) {
+    // Existing Durable Object state may predate the client's newly generated
+    // compaction summary. Merge the credential-bound capsule additively for
+    // this turn; never replace newer durable history with a replayed capsule.
+    lease.portableProtocolTail = mergePortableTaskTails(
+      lease.portableProtocolTail,
+      compactedPortableTail,
+    );
+  }
   const unseenCheckpoint = turnEntryCheckpoint(lease);
   const portableBaseTail = lease.portableProtocolTail;
   // An answer-only routing checkpoint intentionally seeds an uncommitted
@@ -6993,6 +7256,7 @@ async function responsesCore(
     const prepared = prepareResponsesMultimodal(activeInput);
     attachments = prepared.attachments;
     compactOversizedResponsesToolOutputs(prepared.value);
+    compactOversizedResponsesToolOutputs(prepared.inferenceValue);
     const parsedLedger = await parseResponsesToolLedger(prepared.value, {
       completedSnapshots: storedToolSnapshots(lease.toolLedgerSnapshot),
       seed: lease.pendingCallId ? [{
@@ -7002,7 +7266,7 @@ async function responsesCore(
       }] : [],
     });
     ledger = recoverRepeatedPendingProposal(parsedLedger);
-    const promptValue = omitRecoveredPendingProposals(prepared.value, parsedLedger, ledger);
+    const promptValue = omitRecoveredPendingProposals(prepared.inferenceValue, parsedLedger, ledger);
     recoveredRepeatedProposal = recoveredRepeatedPendingProposal(parsedLedger, ledger);
     const ledgerFailure = toolLedgerPreflight(ledger);
     if (ledgerFailure) {
@@ -7045,6 +7309,7 @@ async function responsesCore(
     // does not enter this branch, avoiding duplication of the current turn.
     if (resolution.rebound
       || (!lease.started && Boolean(lease.portableProtocolTail))
+      || hasCompactedTaskContext
       || shouldRestorePortableTaskFollowup(lease, currentTurnPrompt)) {
       prompt = restorePortableProtocolPrompt(lease.portableProtocolTail, currentTurnPrompt, promptLimit, promptTokenLimit);
     }
@@ -7063,12 +7328,12 @@ async function responsesCore(
     promptLimit,
     promptTokenLimit,
   );
-  if (parsed.stream) return responsesStream(env, session, lease, account, prompt, currentTurnPrompt, portableBaseTail, model, tone, responseId, responseSessionKey, parsed.tools, parsed.tool_choice, attachments, ledger, accountRouteRecoveryPrompt, deadlineAt, responseBranch, signal, metrics, outputs.length > 0, streamLifecycle);
+  if (parsed.stream) return responsesStream(env, session, lease, account, prompt, currentTurnPrompt, portableBaseTail, model, tone, responseId, responseSessionKey, parsed.tools, parsed.tool_choice, attachments, ledger, accountRouteRecoveryPrompt, deadlineAt, responseBranch, signal, metrics, outputs.length > 0, streamLifecycle, requestsPublicReasoning(parsed.reasoning));
   try {
     const turn = await resolveAssistantTurn(env, session, lease, account, prompt, tone, parsed.tools, parsed.tool_choice, attachments, ledger, ledger, undefined, signal, undefined, deadlineAt, metrics, accountRouteRecoveryPrompt, outputs.length > 0);
     const { call, result } = turn;
     markCheckpointMetric(metrics, result);
-    const output = responseOutput(responseId, result, call, parsed.tools);
+    const output = appendPublicReasoning(responseOutput(responseId, result, call, parsed.tools), result.publicReasoningSummary, requestsPublicReasoning(parsed.reasoning));
     if (signal.aborted) throw new Error("REQUEST_ABORTED");
     const finalTail = appendPortableProtocolTurn(portableBaseTail, currentTurnPrompt, portableAssistantResult(result, call));
     await completeFinalTurn(session, lease, result, finalTail, ledger);
@@ -7318,78 +7583,6 @@ async function responses(request: Request, env: Env, metrics?: RequestMetricTrac
   return quick.response;
 }
 
-export function imageGenerationData(
-  images: readonly string[],
-  format: "url" | "b64_json",
-  limit: number,
-): Array<{ url: string } | { b64_json: string }> {
-  return images.slice(0, limit).map((image) => {
-    if (format === "url") return { url: image };
-    if (!image.startsWith("data:image/")) throw new Error("IMAGE_RESPONSE_FORMAT_UNAVAILABLE");
-    const separator = image.indexOf(",");
-    if (separator < 0 || separator === image.length - 1) throw new Error("IMAGE_RESPONSE_FORMAT_UNAVAILABLE");
-    return { b64_json: image.slice(separator + 1) };
-  });
-}
-
-async function imageGenerations(request: Request, env: Env, metrics?: RequestMetricTracker): Promise<Response> {
-  const deadlineAt = logicalRequestDeadlineAt();
-  const raw = await body<unknown>(request);
-  const normalized = normalizeImageGenerationRequest(raw);
-  const modelValue = raw && typeof raw === "object" && !Array.isArray(raw)
-    ? (raw as Record<string, unknown>).model
-    : undefined;
-  const model = canonicalModel(typeof modelValue === "string" && modelValue.trim() ? modelValue : undefined);
-  metrics?.observeInputText(normalized.prompt);
-
-  const session = chatSession(env, `image-generation:${crypto.randomUUID()}`);
-  const lease = await acquireConversationLease(env, session, deadlineAt, request.signal);
-  const unseenCheckpoint = turnEntryCheckpoint(lease);
-  let account: AccountSelection;
-  try {
-    const resolution = await accountForLease(env, session, lease);
-    account = resolution.account;
-    metrics?.setAccountId(account.accountId);
-  } catch (cause) {
-    await session.release(lease.leaseId);
-    throw cause;
-  }
-
-  try {
-    const sizeInstruction = normalized.size === "auto" ? "" : ` Target canvas: ${normalized.size}.`;
-    const countInstruction = normalized.n > 1 ? ` Return up to ${normalized.n} distinct images.` : "";
-    const result = await exchange(
-      env,
-      session,
-      lease,
-      account,
-      `Generate an image: ${normalized.prompt}.${sizeInstruction}${countInstruction}`,
-      "magic",
-      undefined,
-      "none",
-      undefined,
-      undefined,
-      request.signal,
-      undefined,
-      deadlineAt,
-      metrics,
-    );
-    observeMetricResult(metrics, result);
-    if (request.signal.aborted) throw new Error("REQUEST_ABORTED");
-    if (!result.images?.length) throw new Error("UPSTREAM_RETURNED_NO_IMAGE");
-    const data = imageGenerationData(result.images, normalized.responseFormat, normalized.n);
-    await session.release(lease.leaseId);
-    return Response.json({
-      created: Math.floor(Date.now() / 1_000),
-      data,
-      model,
-    }, { headers: { "Cache-Control": "no-store" } });
-  } catch (cause) {
-    await abandonUnseenTurn(session, lease.leaseId, unseenCheckpoint);
-    throw cause;
-  }
-}
-
 export async function openAIRequest(
   request: Request,
   env: Env,
@@ -7400,8 +7593,10 @@ export async function openAIRequest(
     if (url.pathname === "/v1/chat/completions" && request.method === "POST") return await chatCompletions(request, env, metrics);
     if (url.pathname === "/v1/responses" && request.method === "POST") return await responses(request, env, metrics);
     if (url.pathname === "/v1/responses/compact" && request.method === "POST") return await responsesCompact(request, env);
-    if (url.pathname === "/v1/images/generations" && request.method === "POST") return await imageGenerations(request, env, metrics);
-    if (["/v1/chat/completions", "/v1/responses", "/v1/responses/compact", "/v1/images/generations"].includes(url.pathname)) {
+    if (["/v1/images/generations", "/v1/images/edits", "/v1/images/variations"].includes(url.pathname)) {
+      return apiError(501, "image_generation_not_supported", "server-side image generation is not supported");
+    }
+    if (["/v1/chat/completions", "/v1/responses", "/v1/responses/compact"].includes(url.pathname)) {
       return apiError(405, "method_not_allowed", `POST is required for ${url.pathname}`);
     }
     return apiError(404, "not_found", "OpenAI-compatible endpoint not found");
@@ -7431,8 +7626,6 @@ export async function openAIRequest(
     }
     if (code === "CURRENT_TURN_TOO_LARGE") return apiError(400, "context_length_exceeded", "the current user/tool turn exceeds this model's input limit and cannot be truncated safely");
     if (code === "TOOL_DEFINITIONS_EXCEED_MODEL_CONTEXT") return apiError(413, "tools_exceed_context", "tool definitions leave too little usable context for this model");
-    if (code === "UPSTREAM_RETURNED_NO_IMAGE") return apiError(502, "upstream_returned_no_image", "Microsoft 365 completed the request without an image resource");
-    if (code === "IMAGE_RESPONSE_FORMAT_UNAVAILABLE") return apiError(502, "unsupported_response_format", "Microsoft 365 returned an image URL instead of inline base64 data");
     if (code === "NO_ACCOUNT") return apiError(503, "no_account", "no Microsoft 365 account is configured");
     if (code === "NO_HEALTHY_ACCOUNT" || code === "SESSION_ACCOUNT_COOLDOWN") return apiError(429, "account_cooldown", "all eligible Microsoft 365 accounts are cooling down; retry later");
     if (code === "NO_USABLE_ACCOUNT") return apiError(503, "account_pool_isolated", "all Microsoft 365 accounts require administrator attention");

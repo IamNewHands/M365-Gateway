@@ -28,7 +28,7 @@ function evidence(
   argumentsValue: unknown,
   result = "Process exited with code 0\nSuccess",
 ): CompletionEvidenceRecord {
-  return { name, arguments: argumentsValue, result, failed: false };
+  return { name, arguments: argumentsValue, result };
 }
 
 function codeModeCommand(cmd: string): { input: string } {
@@ -56,7 +56,7 @@ describe("completion evidence operation boundaries", () => {
       .toEqual(["verify"]);
   });
 
-  it("accepts an ordered write followed by an exact caller-local read-back", () => {
+  it("does not accept an ordered write/read-back when only the outer Code Mode wrapper completed", () => {
     const script = [
       'const write = await tools.exec_command({cmd: "Set-Content -Path index.html -Value \'ok\' -NoNewline"});',
       'const read = await tools.exec_command({cmd: "Get-Content -Raw -Path index.html"});',
@@ -65,13 +65,56 @@ describe("completion evidence operation boundaries", () => {
     const record = evidence("exec", { input: script }, "Script completed\n\"ok\"");
     const summary = summarizeCompletionEvidence({ completed: [record], pending: [] });
 
-    expect(summary.actions.configure?.latest).toBe("success");
-    expect(summary.actions.create?.latest).toBe("success");
-    expect(summary.actions.verify?.latest).toBe("success");
+    expect(summary.actions.configure?.latest).toBe("unknown");
+    expect(summary.actions.create?.latest).toBe("unknown");
+    expect(summary.actions.verify?.latest).toBe("unknown");
     expect(evaluateCompletionEvidence("写入并验证已完成。", summary)).toMatchObject({
-      allowed: true,
-      reason: "supported",
+      allowed: false,
+      reason: "unknown_evidence",
     });
+  });
+
+  it("preserves structured child exit codes over wrapper text", async () => {
+    const call = { type: "function_call", call_id: "call_verify", name: "exec", arguments: JSON.stringify(codeModeCommand("npm test")) };
+    const succeeded = await parseResponsesToolLedger([
+      call,
+      { type: "function_call_output", call_id: "call_verify", output: { exit_code: 0, output: "Script completed\nnot found is test fixture text" } },
+    ]);
+    const failed = await parseResponsesToolLedger([
+      { ...call, call_id: "call_failed" },
+      { type: "function_call_output", call_id: "call_failed", output: { exit_code: 1, output: "Script completed" } },
+    ]);
+
+    expect(succeeded.completed[0]).toMatchObject({ failed: false, status: "success" });
+    expect(summarizeCompletionEvidence(succeeded).actions.verify?.latest).toBe("success");
+    expect(failed.completed[0]).toMatchObject({ failed: true, status: "failure" });
+    expect(summarizeCompletionEvidence(failed).actions.verify?.latest).toBe("failure");
+  });
+
+  it("decodes HTML whitespace before classifying a wrapped inner command failure", async () => {
+    const ledger = await parseResponsesToolLedger([
+      { type: "function_call", call_id: "call_encoded", name: "exec", arguments: JSON.stringify(codeModeCommand("npm test")) },
+      { type: "function_call_output", call_id: "call_encoded", output: "Script completed\n&#x20; not found" },
+    ]);
+
+    expect(ledger.completed[0]).toMatchObject({ failed: true, status: "failure" });
+    expect(evaluateCompletionEvidence("测试已完成。", ledger)).toMatchObject({
+      allowed: false,
+      reason: "failed_evidence",
+    });
+  });
+
+  it("keeps ambiguous wrapper status unknown across Responses snapshots", async () => {
+    const ledger = await parseResponsesToolLedger([
+      { type: "function_call", call_id: "call_ambiguous", name: "exec", arguments: JSON.stringify(codeModeCommand("npm test")) },
+      { type: "function_call_output", call_id: "call_ambiguous", output: "Script completed\nTests produced no child exit code" },
+    ]);
+    const snapshots = completedToolSnapshots(ledger);
+    const restored = await parseResponsesToolLedger([], { completedSnapshots: snapshots });
+
+    expect(ledger.completed[0]).toMatchObject({ failed: false, status: "unknown" });
+    expect(snapshots[0]).toMatchObject({ failed: false, status: "unknown" });
+    expect(summarizeCompletionEvidence(restored).actions.verify?.latest).toBe("unknown");
   });
 
   it("rejects the exact mixed Codex terminal after a polluted patch and passive read-back", () => {
