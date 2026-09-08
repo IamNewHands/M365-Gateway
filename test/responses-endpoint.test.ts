@@ -17,6 +17,9 @@ interface ScriptedInvocation {
   plugins: Array<Record<string, unknown>>;
   toolChoice: unknown;
   attachments: unknown[];
+  imageUrl: unknown;
+  queryAnnotations: unknown;
+  messageQueryAnnotations: unknown;
 }
 
 interface TestCredential {
@@ -78,7 +81,7 @@ function installChatHub(
       }
       const frame = String(event.data).split(RS).find((part) => part.trim());
       if (!frame) return;
-      const payload = JSON.parse(frame) as { arguments?: Array<{ message?: { text?: string; attachments?: unknown[] }; plugins?: unknown; toolChoice?: unknown }> };
+      const payload = JSON.parse(frame) as { arguments?: Array<{ message?: { text?: string; attachments?: unknown[]; imageUrl?: unknown; queryAnnotations?: unknown }; queryAnnotations?: unknown; plugins?: unknown; toolChoice?: unknown }> };
       const invocation = payload.arguments?.[0];
       const prompt = String(invocation?.message?.text ?? "");
       prompts.push(prompt);
@@ -91,6 +94,9 @@ function installChatHub(
         plugins: Array.isArray(invocation?.plugins) ? invocation.plugins as Array<Record<string, unknown>> : [],
         toolChoice: invocation?.toolChoice,
         attachments: invocation?.message?.attachments ?? [],
+        imageUrl: invocation?.message?.imageUrl,
+        queryAnnotations: invocation?.queryAnnotations,
+        messageQueryAnnotations: invocation?.message?.queryAnnotations,
       };
       invocations.push(record);
       script(record);
@@ -172,6 +178,54 @@ afterEach(async () => {
 });
 
 describe("Responses endpoint regressions", () => {
+  it.each([false, true])("keeps tool continuation intact with requested public summaries (stream=%s)", async (stream) => {
+    const auth = await credential();
+    const summary = "**公开摘要**\n正在核对请求的一个值。";
+    const cmd = "Get-Content '中文目录/data.txt'; [Math]::Max(0, $a)";
+    const tool = { type: "function", name: "exec_command", parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } };
+    let calls = 0;
+    installChatHub(({ socket, prompt }) => {
+      if (prompt.includes("SEMANTIC TASK CONTINUATION AUDIT")) { complete(socket, "NO_TOOL_REQUIRED"); return; }
+      calls += 1;
+      if (calls === 1) {
+        socket.send(`${JSON.stringify({ type: 1, target: "update", arguments: [{ messages: [{ author: "bot", messageType: "Progress", contentOrigin: "ChainOfThoughtSummary", text: summary }] }] })}${RS}`);
+        completeToolCall(socket, "exec_command", { cmd });
+      } else complete(socket, "The lookup returned fixture_value_17.");
+    });
+    const response = await postResponse(auth.apiKey, {
+      input: "Read the requested local value and report it.", tools: [tool],
+      reasoning: { effort: "high", summary: "auto" }, stream,
+    });
+    expect(response.status).toBe(200);
+    const wire = await response.text();
+    const events = stream ? wire.split("\n").filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6))) : [];
+    const first = stream ? events.find((event) => event.type === "response.completed")?.response : JSON.parse(wire);
+    expect(first.output).toHaveLength(2);
+    expect(first.output[0]).toMatchObject({ type: "function_call", name: "exec_command", arguments: JSON.stringify({ cmd }) });
+    expect(first.output[1]).toMatchObject({ type: "reasoning", summary: [{ type: "summary_text", text: summary }] });
+    if (stream) {
+      expect(events.filter((event) => event.type === "response.reasoning_summary_text.done")).toMatchObject([{ output_index: 1, summary_index: 0, text: summary }]);
+      expect(events.filter((event) => event.type === "response.function_call_arguments.done")[0].output_index).toBe(0);
+      expect(events.at(-1).type).toBe("response.completed");
+    }
+    const next = await postResponse(auth.apiKey, {
+      previous_response_id: first.id,
+      input: [{ type: "function_call_output", call_id: first.output[0].call_id, output: "fixture_value_17" }],
+    });
+    expect(next.status).toBe(200);
+    expect(await next.json()).toMatchObject({ output: [{ type: "message", content: [{ text: "The lookup returned fixture_value_17." }] }] });
+  });
+
+  it("does not expose a public summary unless the Responses caller requests it", async () => {
+    const auth = await credential();
+    installChatHub(({ socket }) => {
+      socket.send(`${JSON.stringify({ type: 1, target: "update", arguments: [{ messages: [{ author: "bot", messageType: "Progress", contentOrigin: "ChainOfThoughtSummary", text: "A real optional public summary." }] }] })}${RS}`);
+      complete(socket, "normal final answer");
+    });
+    const response = await postResponse(auth.apiKey, { input: "hello", reasoning: { effort: "high" } });
+    expect(await response.json()).toMatchObject({ output: [{ type: "message", content: [{ text: "normal final answer" }] }] });
+  });
+
   it("preserves arbitrary top-level instructions and user input in the ChatHub prompt", async () => {
     const auth = await credential();
     const instruction = `开发约束-${crypto.randomUUID()}：根据当前任务自主选择工具，完成后核验结果；不要把这句话映射为固定命令。`;
@@ -233,7 +287,11 @@ describe("Responses endpoint regressions", () => {
     expect(await response.text()).toContain("IMAGE_TRANSPORT_OK");
     expect(hub.invocations).toHaveLength(1);
     expect(hub.invocations[0]?.attachments).toEqual([]);
+    expect(hub.invocations[0]?.imageUrl).toBeUndefined();
+    expect(hub.invocations[0]?.queryAnnotations).toBeUndefined();
+    expect(hub.invocations[0]?.messageQueryAnnotations).toBeUndefined();
     expect(hub.uploads).toEqual([{ conversationId: hub.urls[0]?.searchParams.get("ConversationId"), image: imageURL }]);
+    expect(hub.urls[0]?.searchParams.get("XRoutingParameterSessionKey")).toBe(hub.urls[0]?.searchParams.get("chatsessionid"));
     expect(hub.prompts[0]).not.toContain(imageURL);
   });
 
@@ -257,6 +315,49 @@ describe("Responses endpoint regressions", () => {
     expect(hub.uploads).toEqual([{ conversationId: hub.urls[0]?.searchParams.get("ConversationId"), image: imageURL }]);
     expect(hub.prompts[0]).not.toContain(imageURL);
     expect(hub.invocations[0].attachments).toEqual([]);
+    expect(hub.invocations[0].imageUrl).toBeUndefined();
+    expect(hub.invocations[0].queryAnnotations).toBeUndefined();
+    expect(hub.invocations[0].messageQueryAnnotations).toBeUndefined();
+    expect(hub.urls[0]?.searchParams.get("XRoutingParameterSessionKey")).toBe(hub.urls[0]?.searchParams.get("chatsessionid"));
+  });
+
+  it("answers from a fresh tool image instead of reissuing view_image with another detail level", async () => {
+    const auth = await credential();
+    const imageURL = "data:image/png;base64,AAAA";
+    const imagePath = "C:/Users/exampleuser/Desktop/screen.png";
+    const tool = {
+      type: "function",
+      name: "view_image",
+      description: "View an image file from the caller's local filesystem",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" }, detail: { type: "string", enum: ["high", "original"] } },
+        required: ["path"],
+        additionalProperties: false,
+      },
+    };
+    const hub = installChatHub(({ index, socket }) => index === 0
+      ? completeToolCall(socket, "view_image", { path: imagePath, detail: "original" })
+      : complete(socket, "I see a dark chat interface with an image-recognition failure message."));
+    const response = await postResponse(auth.apiKey, {
+      input: [
+        { role: "user", content: `${imagePath}\n\nWhat do you see?` },
+        { type: "function_call", call_id: "call_image_once", name: "view_image", arguments: JSON.stringify({ path: imagePath, detail: "high" }) },
+        { type: "function_call_output", call_id: "call_image_once", output: [
+          { type: "input_text", text: "Image loaded successfully." },
+          { type: "input_image", image_url: imageURL, detail: "high" },
+        ] },
+      ],
+      tools: [tool],
+      tool_choice: "auto",
+    });
+    const body = await response.json<{ output: Array<{ type: string; content?: Array<{ text?: string }> }> }>();
+    expect(response.status).toBe(200);
+    expect(body.output.some((item) => item.type === "function_call")).toBe(false);
+    expect(JSON.stringify(body.output)).toContain("dark chat interface");
+    expect(hub.invocations.length).toBeGreaterThanOrEqual(2);
+    expect(hub.invocations[1]?.plugins).toEqual([]);
+    expect(hub.uploads).toEqual([{ conversationId: hub.urls[0]?.searchParams.get("ConversationId"), image: imageURL }]);
   });
 
   it("uploads an output-only image continuation using its pending call_id", async () => {
@@ -279,6 +380,10 @@ describe("Responses endpoint regressions", () => {
     expect(hub.uploads).toHaveLength(1);
     expect(hub.prompts.at(-1)).toContain("Capture succeeded.");
     expect(hub.prompts.at(-1)).not.toContain(imageURL);
+    expect(hub.invocations.at(-1)?.imageUrl).toBeUndefined();
+    expect(hub.invocations.at(-1)?.queryAnnotations).toBeUndefined();
+    expect(hub.invocations.at(-1)?.messageQueryAnnotations).toBeUndefined();
+    expect(hub.urls.at(-1)?.searchParams.get("XRoutingParameterSessionKey")).toBe(hub.urls.at(-1)?.searchParams.get("chatsessionid"));
   });
 
   it("retains custom tool image output through the Responses custom-tool adapter", async () => {
@@ -296,6 +401,10 @@ describe("Responses endpoint regressions", () => {
     expect(await response.text()).toContain("CUSTOM_IMAGE_RECEIVED");
     expect(hub.uploads).toHaveLength(1);
     expect(hub.prompts[0]).not.toContain(imageURL);
+    expect(hub.invocations[0]?.imageUrl).toBeUndefined();
+    expect(hub.invocations[0]?.queryAnnotations).toBeUndefined();
+    expect(hub.invocations[0]?.messageQueryAnnotations).toBeUndefined();
+    expect(hub.urls[0]?.searchParams.get("XRoutingParameterSessionKey")).toBe(hub.urls[0]?.searchParams.get("chatsessionid"));
   });
 
   it("compacts image tool history without uploading or retaining binary media", async () => {
@@ -321,6 +430,96 @@ describe("Responses endpoint regressions", () => {
     expect(JSON.stringify(capsule)).not.toContain("data:image");
     expect(outbound).not.toHaveBeenCalled();
   });
+
+  it("restores the assistant task summary after compaction before a progress question", async () => {
+    const auth = await credential();
+    const shared = `compact-summary-${crypto.randomUUID()}`;
+    const task = `COMPACT_TASK_${crypto.randomUUID().replaceAll("-", "")}`;
+    const summary = `COMPACT_SUMMARY_${crypto.randomUUID().replaceAll("-", "")}: 首页和导航已经完成，后台重构与构建验证仍待执行。`;
+    const followUp = "告诉我进度";
+    const hub = installChatHub(({ index, socket }) => complete(
+      socket,
+      index === 0 ? "The task is in progress." : "The retained task summary is available.",
+    ));
+
+    const started = await postResponse(auth.apiKey, {
+      prompt_cache_key: shared,
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: task }] }],
+    });
+    expect(started.status).toBe(200);
+
+    const compacted = await SELF.fetch("https://example.com/v1/responses/compact", {
+      method: "POST",
+      headers: requestHeaders(auth.apiKey),
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        prompt_cache_key: shared,
+        input: [
+          { type: "message", role: "user", content: [{ type: "input_text", text: task }] },
+          { type: "message", role: "assistant", content: [{ type: "output_text", text: summary }] },
+        ],
+      }),
+    });
+    expect(compacted.status).toBe(200);
+    const compactBody = await compacted.json<{ output: Array<Record<string, unknown>> }>();
+
+    const resumed = await postResponse(auth.apiKey, {
+      prompt_cache_key: shared,
+      input: [
+        ...compactBody.output,
+        { type: "message", role: "user", content: [{ type: "input_text", text: followUp }] },
+      ],
+    });
+    expect(resumed.status).toBe(200);
+    expect(await resumed.text()).toContain("The retained task summary is available.");
+    expect(hub.prompts).toHaveLength(2);
+    expect(hub.prompts[1]).toContain("PORTABLE HISTORY FROM THE SAME API-CREDENTIAL SESSION");
+    expect(hub.prompts[1]).toContain(summary);
+    expect(hub.prompts[1]).toContain(followUp);
+  }, 15_000);
+
+  it("uses a shared compaction key and still accepts capsules issued with the legacy data key", async () => {
+    const auth = await credential();
+    installChatHub(({ socket }) => complete(socket, "COMPACTION_KEY_ROLLOUT_OK"));
+    const mutableEnv = env as typeof env & { COMPACTION_ENCRYPTION_KEY?: string };
+    const originalSharedKey = mutableEnv.COMPACTION_ENCRYPTION_KEY;
+    const sharedKey = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    const promptCacheKey = `compact-key-rollout-${crypto.randomUUID()}`;
+    const compact = async (input: Array<Record<string, unknown>>) => {
+      const response = await SELF.fetch("https://example.com/v1/responses/compact", {
+        method: "POST",
+        headers: requestHeaders(auth.apiKey),
+        body: JSON.stringify({ model: "gpt-5.6-sol", prompt_cache_key: promptCacheKey, input }),
+      });
+      expect(response.status).toBe(200);
+      return response.json<{ output: Array<{ type: string; encrypted_content?: string }> }>();
+    };
+
+    try {
+      delete mutableEnv.COMPACTION_ENCRYPTION_KEY;
+      const legacy = await compact([{ role: "user", content: "Preserve this legacy task." }]);
+
+      mutableEnv.COMPACTION_ENCRYPTION_KEY = sharedKey;
+      const upgraded = await compact([
+        ...legacy.output,
+        { role: "user", content: "Continue after the key rollout." },
+      ]);
+      const encrypted = upgraded.output.find((item) => item.type === "compaction")?.encrypted_content;
+      expect(encrypted).toBeTruthy();
+      await expect(decryptJSON(encrypted!, env.DATA_ENCRYPTION_KEY)).rejects.toThrow();
+      await expect(decryptJSON(encrypted!, sharedKey)).resolves.toMatchObject({ version: 3 });
+
+      const resumed = await postResponse(auth.apiKey, {
+        prompt_cache_key: promptCacheKey,
+        input: [...upgraded.output, { role: "user", content: "Report retained state." }],
+      });
+      expect(resumed.status).toBe(200);
+      expect(await resumed.text()).toContain("COMPACTION_KEY_ROLLOUT_OK");
+    } finally {
+      if (originalSharedKey === undefined) delete mutableEnv.COMPACTION_ENCRYPTION_KEY;
+      else mutableEnv.COMPACTION_ENCRYPTION_KEY = originalSharedKey;
+    }
+  }, 15_000);
 
   it("reports a real upload rejection distinctly and permits retry of the unconsumed tool result", async () => {
     const auth = await credential();

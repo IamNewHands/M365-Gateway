@@ -19,6 +19,7 @@ const defaultModels = [
   "gpt-5.5-reasoning",
   "gpt-5.6-sol",
   "gpt-5.6-reasoning",
+  "gpt-6-astra",
   "claude-sonnet",
   "claude-sonnet-reasoning",
 ];
@@ -27,6 +28,7 @@ const catalogModels = [
   "gpt-5.5-reasoning",
   "gpt-5.6-sol",
   "gpt-5.6-reasoning",
+  "gpt-6-astra",
   "claude-sonnet",
   "claude-sonnet-reasoning",
 ];
@@ -542,31 +544,9 @@ if (runVisionInput) await stage("vision.input", async () => {
 });
 else record("vision.input", true, "skipped=true;reason=optional_image_capability_disabled;set_M365_TEST_VISION_INPUT=1_to_probe", { skipped: true });
 
-// Image generation is an optional, quota-consuming capability. Keep it out of
-// the normal text/tool acceptance run; opt in explicitly when a tenant has
-// image entitlement and this capability is the subject of the test.
-if (process.env.M365_TEST_IMAGE_GENERATION === "1") {
-  await stage("image.generation.url", async () => {
-    const result = await jsonRequest("/v1/images/generations", {
-      model: "gpt-5.6-sol",
-      prompt: "A minimal blue circle centered on a plain white background",
-      n: 1,
-      size: "1024x1024",
-      response_format: "url",
-    }, { timeoutMs: 570_000 });
-    const image = String(result.json?.data?.[0]?.url ?? "");
-    const hasImageResource = /^https:\/\/[^\s]+/u.test(image) || /^data:image\/[^,]+,[^\s]+/iu.test(image);
-    const imageAvailable = result.response.status === 200 && hasImageResource;
-    const error = errorCode(result.json);
-    record(
-      "image.generation.url",
-      imageAvailable,
-      `status=${result.response.status};code=${error || "none"};capability=${imageAvailable ? "available" : "failed"};required=true;resource=${hasImageResource ? "present" : "missing"}`,
-    );
-  });
-} else {
-  record("image.generation.url", true, "skipped=true;reason=optional_image_capability_disabled;set_M365_TEST_IMAGE_GENERATION=1_to_probe", { skipped: true });
-}
+// Server-side image generation was removed. Even a stale opt-in environment
+// variable must not submit quota-consuming generation requests.
+record("image.generation.url", true, "skipped=true;reason=image_generation_removed", { skipped: true });
 
 if (concurrencyEnabled) await stage("concurrency", async () => {
   const jobs = Array.from({ length: 4 }, async (_, index) => {

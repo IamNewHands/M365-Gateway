@@ -1,20 +1,20 @@
 {
-  "release": "m365-gateway-public-source-2026-09-05",
-  "createdAt": "2026-09-05T15:08:53.810Z",
+  "release": "m365-gateway-public-source-2026-09-08",
+  "createdAt": "2026-09-08T04:19:50.769Z",
   "sourceOfTruth": "Sanitized local canonical source; not a downloaded production bundle",
   "sourceStatus": "sanitized_local_source",
   "validation": {
     "canonicalCheck": {
       "status": "passed",
-      "testFiles": 17,
-      "tests": 358,
-      "logSha256": "e130959c6a90a9048d7f396b6ff8bfc1a33d50141c4b3724bb0430421a287709"
+      "testFiles": 25,
+      "tests": 466,
+      "logSha256": "2eaed001357509eba7e3d74a0007013cc69211658d467fa37680e669b840080b"
     },
     "stageCheck": {
       "status": "passed",
-      "testFiles": 17,
-      "tests": 358,
-      "logSha256": "384ab344bc9d69440ed9f376acf940c15d6801cbec0ba6b7b0b762927cb52832"
+      "testFiles": 25,
+      "tests": 466,
+      "logSha256": "41d08240b9e8f3ac02fbf385c0080f5da3d11602e3fd52fd45424ba50ff1dd60"
     },
     "vision": "not_live_verified"
   },

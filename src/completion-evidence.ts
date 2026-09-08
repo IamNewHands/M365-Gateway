@@ -112,6 +112,8 @@ const operationalActions: readonly OperationalAction[] = [
 ];
 
 const failureSignal = /(?:exit\s*(?:code|status)?\s*[:=]?\s*[1-9]\d*|\berror\b|\bfailed\b|\bfailure\b|exception|traceback|timed?\s*out|timeout|permission denied|not found|refused|cancel(?:led|ed)|operation was canceled|\u9519\u8bef|\u5931\u8d25|\u8d85\u65f6|\u62d2\u7edd|\u65e0\u6743\u9650|\u627e\u4e0d\u5230|\u4e0d\u5b58\u5728|\u5df2\u53d6\u6d88)/iu;
+const processExitSignal = /(?:^|\n)Process exited with code\s+(-?\d+)(?:\s|$)/iu;
+const codeModeCompletionWrapper = /^\s*Script completed(?:\r?\n|\s*$)/iu;
 
 /** Tool names are declared protocol metadata. They may identify an operation,
  * but their opaque arguments may contain arbitrary source files, patches, or
@@ -461,12 +463,43 @@ function compactResultText(result: unknown): string {
   }
 }
 
+function normalizedStatusText(result: unknown): string {
+  return compactResultText(result)
+    .replace(/&(?:#x0*20|#0*32|nbsp);/giu, " ")
+    .replace(/\r\n?/gu, "\n");
+}
+
+function structuredResultStatus(result: unknown): Exclude<CompletionEvidenceStatus, "pending"> | null {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return null;
+  const value = result as Record<string, unknown>;
+  for (const key of ["exit_code", "exitCode"] as const) {
+    const raw = value[key];
+    if (typeof raw === "number" && Number.isFinite(raw)) return raw === 0 ? "success" : "failure";
+    if (typeof raw === "string" && /^-?\d+$/u.test(raw.trim())) return Number(raw) === 0 ? "success" : "failure";
+  }
+  for (const key of ["is_error", "isError", "failed"] as const) {
+    if (typeof value[key] === "boolean") return value[key] ? "failure" : "success";
+  }
+  if (typeof value.success === "boolean") return value.success ? "success" : "failure";
+  return null;
+}
+
 function evidenceStatus(record: CompletionEvidenceRecord): Exclude<CompletionEvidenceStatus, "pending"> {
   if (record.status) return record.status;
   if (record.failed === true) return "failure";
-  if (record.failed === false) return "success";
-  const result = compactResultText(record.result);
+  const structured = structuredResultStatus(record.result);
+  if (structured) return structured;
+  const result = normalizedStatusText(record.result);
   if (!result.trim()) return "unknown";
+  const processExit = processExitSignal.exec(result.slice(0, 1_024));
+  if (processExit) return Number(processExit[1]) === 0 ? "success" : "failure";
+  // `Script completed` is the Code Mode wrapper's status, not the status of
+  // nested exec_command calls. Without a child exit code it cannot authorize
+  // a completion claim, even when older adapters supplied `failed: false`.
+  if (normalizedOperationName(record.name) === "exec" && codeModeCompletionWrapper.test(result)) {
+    return failureSignal.test(result) ? "failure" : "unknown";
+  }
+  if (record.failed === false) return "success";
   return failureSignal.test(result) ? "failure" : "success";
 }
 

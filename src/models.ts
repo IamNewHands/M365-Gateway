@@ -8,19 +8,23 @@ interface ModelSpec {
 }
 
 const MODELS: ModelSpec[] = [
-  { id: "gpt-5.5", owner: "microsoft-365", contextWindow: 1_050_000, maxOutputTokens: 128_000, reasoning: true },
-  { id: "gpt-5.5-reasoning", owner: "microsoft-365", contextWindow: 1_050_000, maxOutputTokens: 128_000, reasoning: true },
-  { id: "gpt-5.6-sol", owner: "microsoft-365", contextWindow: 1_050_000, maxOutputTokens: 128_000, reasoning: true },
-  { id: "gpt-5.6-reasoning", owner: "microsoft-365", contextWindow: 1_050_000, maxOutputTokens: 128_000, reasoning: true },
+  { id: "gpt-5.5", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true },
+  { id: "gpt-5.5-reasoning", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true },
+  { id: "gpt-5.6-sol", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true },
+  { id: "gpt-5.6-reasoning", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true },
+  // CF2 accepted this exact ChatHub tone and rejected a deliberately invalid
+  // control tone. Microsoft still does not expose a resolved weight/version
+  // in the response, so availability remains tenant-dependent.
+  { id: "gpt-6-astra", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent" },
   { id: "claude-sonnet", owner: "anthropic-via-microsoft-365", contextWindow: 200_000, maxOutputTokens: 64_000, reasoning: true },
   { id: "claude-sonnet-reasoning", owner: "anthropic-via-microsoft-365", contextWindow: 200_000, maxOutputTokens: 64_000, reasoning: true },
 ];
 
 // Codex counts the complete client-visible history, while this gateway sends
-// only the active turn into a persisted Microsoft conversation.  The former
-// 90%-of-1.05M value allowed request JSON to grow past the CPU-safe range of a
-// free Cloudflare Worker.  Compact before the gateway's 96k active-prompt
-// budget and before a typical request reaches the 1 MiB Responses ceiling.
+// only the active turn into a persisted Microsoft conversation. Keep the
+// advertised context minus output reserve equal to the gateway's verified 96k
+// active-prompt budget so clients compact before a single turn is too large to
+// summarize safely.
 export const CODEX_AUTO_COMPACT_TOKEN_LIMIT = 90_000;
 
 const ALIASES: Record<string, string> = {
@@ -66,6 +70,7 @@ export function modelTone(model: string, effort: unknown = ""): string {
       ? "Gpt_5_6_Chat"
       : "Gpt_5_6_Reasoning";
     case "gpt-5.6-reasoning": return "Gpt_5_6_Reasoning";
+    case "gpt-6-astra": return "Gpt_6_Astra";
     case "claude-sonnet": return wantsReasoning ? "Claude_Sonnet_Reasoning" : "Claude_Sonnet";
     case "claude-sonnet-reasoning": return "Claude_Sonnet_Reasoning";
     default: throw new Error("UNSUPPORTED_MODEL");
@@ -158,12 +163,35 @@ export function countPromptTokenClasses(value: string): PromptTokenClassCounts {
 
 function reasoningSelection(model: ModelSpec): Record<string, unknown> {
   const efforts = ["low", "medium", "high", "xhigh", "max"];
-  if (model.id === "gpt-5.6-sol") efforts.push("ultra");
+  if (model.id === "gpt-5.6-sol" || model.id === "gpt-6-astra") efforts.push("ultra");
   return {
     default_reasoning_level: model.id === "gpt-5.6-sol" ? "low" : "medium",
     supported_reasoning_levels: efforts.map((effort) => ({ effort, description: `${effort} reasoning` })),
   };
 }
+
+// Both routes returned a real Microsoft public summary in serial CF2 probes.
+// This does not promise a summary on every answer or expose hidden reasoning.
+function hasVerifiedPublicSummary(model: ModelSpec): boolean {
+  return model.id === "gpt-5.6-sol" || model.id === "gpt-5.6-reasoning";
+}
+
+/** Instructions returned in the Codex model manifest.  Keep shell selection
+ * explicit here because this is the one contract the CLI receives before it
+ * emits its first local command.  The gateway must preserve command bytes; it
+ * can only tell the model how to choose a compatible shell. */
+export const CODEX_BASE_INSTRUCTIONS = [
+  "You are Codex. Use the caller-provided tools and their live schemas to inspect, change, and verify the caller's workspace.",
+  "Local patch/diff helpers are disabled: use direct bounded writes or exec_command and verify the result.",
+  "Batch independent read-only checks and validations in one caller-runtime round when their outputs are not prerequisites for each other.",
+  "When several files form one coherent change and a declared execution tool can update them safely, group those writes into one call and use one authoritative verifier instead of spending a model turn on every redundant read-back.",
+  "Choose actions from the current request and returned evidence; do not simulate results, invent a workflow, or substitute a hosted shell for the caller's environment.",
+  "SHELL DISCIPLINE: Treat the caller's declared shell/shell_type and the most recent successful tool result as authoritative. Preserve every command, path, text, and shell argument as opaque bytes; the gateway does not translate Bash, PowerShell, cmd.exe, or a remote SSH command for you.",
+  "When the caller is Windows PowerShell, use PowerShell-native commands such as Get-ChildItem, Get-Content, Test-Path, Set-Content and semicolon sequencing; do not send POSIX find/grep/pwd, Bash &&, or <<EOF heredocs to it. When the caller is Bash/WSL, use POSIX syntax and do not send PowerShell cmdlets.",
+  "If the shell is not known, run one short read-only identity/working-directory check with the declared local tool and then reuse the reported shell; do not guess from a path alone. For Code Mode JavaScript, do not nest a shell heredoc or powershell -Command quoting layer inside the JavaScript source; use a short direct command or a bounded script file.",
+  "After a parser or command-not-found failure, choose a materially different command in the reported shell and keep the failed command only as evidence; never repeat it unchanged or silently rewrite it in transit.",
+  "Do not report a build or deployment as successful without structured exit-code or verifier evidence.",
+].join(" ");
 
 export function modelCatalog(): Record<string, unknown>[] {
   return MODELS.map((model) => ({
@@ -177,7 +205,8 @@ export function modelCatalog(): Record<string, unknown>[] {
     // Extension metadata; clients may still require their own model config.
     // Accepted effort names select two observed routes, not six verified
     // upstream compute budgets. Do not advertise synthetic reasoning text.
-    x_m365_reasoning: { control: "tone_selection", summaries: false },
+    x_m365_reasoning: { control: "tone_selection", summaries: hasVerifiedPublicSummary(model),
+      ...(hasVerifiedPublicSummary(model) ? { summary_delivery: "end_of_turn", public_only: true } : {}) },
     ...(model.availability ? { x_m365_availability: model.availability } : {}),
     capabilities: {
       chat_completions: true,
@@ -218,6 +247,9 @@ export function codexModelCatalog(clientVersion = ""): { models: Record<string, 
       // continuation. Explicit per-task medium/high/max values still flow
       // through unchanged, and the reasoning model remains available.
       ...reasoningSelection(model),
+      // Declare the verified routes without overriding unverified models'
+      // existing client defaults. Explicit client summary=none is respected.
+      ...(hasVerifiedPublicSummary(model) ? { default_reasoning_summary: "auto" } : {}),
       shell_type: "unified_exec",
       visibility: "list",
       supported_in_api: true,
@@ -245,7 +277,7 @@ export function codexModelCatalog(clientVersion = ""): { models: Record<string, 
       node_repl_disabled: false,
       tool_mode: responsesLite ? "code_mode_only" : "direct",
       ...(responsesLite ? { multi_agent_version: "v2" } : {}),
-      base_instructions: "You are Codex. Use the caller-provided tools and their live schemas to inspect, change, and verify the caller's workspace. Local patch/diff helpers are disabled: use direct bounded writes or exec_command and verify the result. Batch independent read-only checks and validations in one caller-runtime round when their outputs are not prerequisites for each other. When several files form one coherent change and a declared execution tool can update them safely, group those writes into one call and use one authoritative verifier instead of spending a model turn on every redundant read-back. Choose actions from the current request and returned evidence; do not simulate results, invent a workflow, or substitute a hosted shell for the caller's environment.",
+      base_instructions: CODEX_BASE_INSTRUCTIONS,
       };
     }),
   };

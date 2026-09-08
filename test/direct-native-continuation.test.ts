@@ -132,6 +132,27 @@ describe("production direct-native continuation", () => {
   });
 
   it.each([
+    ["responses", false], ["responses", true], ["chat/completions", false], ["chat/completions", true], ["messages", false], ["messages", true],
+  ] as const)("does not expose a premature preserved-task checkpoint: %s stream=%s", async (protocol, stream) => {
+    const checkpoint = "已保留当前任务和刚才的工具结果；本轮没有需要再次执行的工具动作，也没有重复已完成的调用。";
+    const invocations = install([checkpoint, checkpoint, { name: "exec_command", args: nextArgs }]);
+    const response = await post(protocol, body(protocol, stream));
+    const text = await response.text();
+    expect(response.status).toBe(200);
+    expect(invocations).toHaveLength(3);
+    expect(text).toContain("exec_command");
+    expect(text).toContain("git add");
+    expect(text).not.toContain(checkpoint);
+    expect(text).not.toContain("本轮没有需要再次执行");
+    if (stream && protocol === "responses") {
+      expect(text.match(/event: response.completed/g)).toHaveLength(1);
+      expect(text).not.toContain("event: response.failed");
+    }
+    if (stream && protocol === "messages") expect(text).toContain('"stop_reason":"tool_use"');
+    if (protocol === "chat/completions") expect(text).toContain('"finish_reason":"tool_calls"');
+  }, 15_000);
+
+  it.each([
     "当前验证结果已经通过，但合并发货专项浏览器覆盖和 8 号服务器同步核验仍未完成，因此阶段工作还不能收尾。",
     "正在定位 8 号服务器的现有部署配置并执行部署，部署后会继续完成远端核验。",
   ])("reconsiders a subjectless or explicit incomplete Chinese terminal: %s", async (candidate) => {
@@ -213,11 +234,29 @@ describe("production direct-native continuation", () => {
     expect(text).not.toContain("continuation_decision_invalid");
   }, 15_000);
 
+  it("falls back to an isolated native tool decision after both text routers are malformed", async () => {
+    const calls = install([
+      promise,
+      { name: "not_declared", args: { cmd: "unsafe" } },
+      "not router json",
+      "still not router json",
+      { name: "exec_command", args: nextArgs },
+    ]);
+    const response = await post("responses", body("responses", false));
+    const text = await response.text();
+    expect(response.status).toBe(200);
+    expect(calls).toHaveLength(5);
+    expect(calls[4].plugins.length).toBeGreaterThan(0);
+    expect(text).toContain("exec_command");
+    expect(text).toContain("git add");
+    expect(text).not.toContain("continuation_decision_invalid");
+  }, 15_000);
+
   it.each([false, true])("bounds persistent invalid continuation decisions without claiming success (stream=%s)", async (stream) => {
     const calls = install([promise]);
     const response = await post("responses", body("responses", stream));
     const text = await response.text();
-    expect(calls).toHaveLength(4);
+    expect(calls).toHaveLength(5);
     expect(text).toContain("continuation_decision_invalid");
     expect(text).not.toContain(promise);
     expect(text).not.toContain("event: response.completed");
@@ -269,7 +308,7 @@ describe("production direct-native continuation", () => {
     // A malformed tool envelope is a model-decision failure, not an account
     // transport failure. The isolated router gets two bounded repair attempts.
     expect(await response.text()).toContain("continuation_decision_invalid");
-    expect(calls).toHaveLength(4);
+    expect(calls).toHaveLength(5);
   }, 15_000);
 
   it("leaves a valid native call single-pass and preserves command punctuation and Unicode", async () => {
@@ -311,6 +350,6 @@ describe("production direct-native continuation", () => {
     }, apiKey);
     expect(next.status).toBe(200);
     expect(await next.text()).toContain("仍有未提交修改");
-    expect(calls).toHaveLength(5);
+    expect(calls).toHaveLength(6);
   }, 15_000);
 });

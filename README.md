@@ -106,7 +106,7 @@ GPT-6 Astra / Claude Fable 5.1 的官方发布信息、M365 产品范围和待�
 - `claude-sonnet`
 - `claude-sonnet-reasoning`
 
-模型目录只声明已经验证的文本、流式、Responses、工具和推理能力。代码库内已接入图片输入附件与 `/v1/images/generations` 候选链路，但尚未完成真实 M365 上游验收，因此模型目录仍将 `vision`、`image_generation` 标记为 `false`，正式部署前也不得把它们宣传为稳定能力。音频、Realtime 和语音没有可用实现，不得伪装成可用。图片输入和图片生成都不是本轮文本/工具稳定性验收的一部分，`scripts/full-functional.mjs` 默认只记录 `skipped`、不发起图片请求、不消耗图片额度；仅在明确具备对应能力并设置 `M365_TEST_VISION_INPUT=1` 或 `M365_TEST_IMAGE_GENERATION=1` 时，才会分别进行真实探测并把有效结果作为强制通过条件。
+模型目录只声明已经验证的文本、流式、Responses、工具和推理能力。服务端生图功能已移除：图片生成、编辑和变体接口明确返回不支持，不调用 Microsoft、不选账号、不申请生成任务。`image_generation` 保持 `false`；旧的 `M365_TEST_IMAGE_GENERATION` 开关不再发起探测。图片输入附件、识图路径以及调用方提供的 `view_image` 等本地工具仍保留，但真实视觉能力尚未完成验收，`vision` 仍为 `false`。`scripts/full-functional.mjs` 默认跳过图片输入，仅在明确具备权限并设置 `M365_TEST_VISION_INPUT=1` 时执行视觉探测。音频、Realtime 和语音没有可用实现，不得伪装成可用。
 
 `gpt-5.6-sol` 在未指定 reasoning effort 时使用低延迟 Chat 路由；需要更深推理时显式请求 `reasoning_effort=medium/high` 或使用 `gpt-5.6-reasoning`。模型目录只保留已验证的六个稳定路由，不再宣传未完成租户验收的 quick、Terra、旧版 GPT 或 Fable/Opus 候选。Microsoft 偶尔会用 HTTP 200 包装容量占位句，网关会将已识别的占位句转换为可重试的 429，避免把“无工具调用”的假成功交给 Codex/OpenCode。
 

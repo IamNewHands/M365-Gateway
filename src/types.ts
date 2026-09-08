@@ -9,6 +9,9 @@ export interface Env {
   INFERENCE: DurableObjectNamespace<InferenceGateway>;
   SENSITIVE_KV: KVNamespace;
   DATA_ENCRYPTION_KEY: string;
+  /** Optional shared key for portable Responses compaction capsules. Deploy
+   * the same value to every gateway endpoint that may serve one client. */
+  COMPACTION_ENCRYPTION_KEY?: string;
   ENVIRONMENT: string;
   TENANT_NAME: string;
   BOOTSTRAP_ADMIN_PASSWORD: string;
