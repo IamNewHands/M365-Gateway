@@ -1,5 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { appendPublicReasoning, publicReasoningEvents, requestsPublicReasoning } from "../src/public-reasoning";
+import { appendPublicReasoning, publicReasoningEvents, publicReasoningWithDefault, requestsPublicReasoning } from "../src/public-reasoning";
+
+describe("Responses-route public reasoning default", () => {
+  it("delivers verified summaries unless the client explicitly opted out", () => {
+    for (const value of [undefined, null, {}, "text", { effort: "medium" }, { summary: "auto" }, { generate_summary: "detailed" }]) {
+      expect(publicReasoningWithDefault(value)).toBe(true);
+    }
+    expect(publicReasoningWithDefault({ summary: "none" })).toBe(false);
+    expect(publicReasoningWithDefault({ generate_summary: "none" })).toBe(false);
+    expect(publicReasoningWithDefault({ summary: "auto", generate_summary: "none" })).toBe(true);
+  });
+});
 
 describe("optional public reasoning Responses wire", () => {
   it("honors summary and the legacy generate_summary without changing ordinary requests", () => {

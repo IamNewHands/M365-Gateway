@@ -31,7 +31,7 @@ import {
   type ToolLedgerSnapshotEntry,
 } from "./tool-ledger";
 import { validateToolArguments } from "./tool-schema";
-import { appendPublicReasoning, publicReasoningEvents, requestsPublicReasoning } from "./public-reasoning";
+import { appendPublicReasoning, publicReasoningEvents, publicReasoningWithDefault } from "./public-reasoning";
 import { createUpstreamGateLifecycle, type UpstreamGateLifecycle } from "./upstream-lifecycle";
 import { MAX_AI_REQUEST_BYTES, MAX_RESPONSES_REQUEST_BYTES, readJSONLimited } from "./request-body";
 import type { RequestMetricTracker } from "./request-metrics";
@@ -275,6 +275,7 @@ interface ChatBody {
   session_key?: string;
   conversation_id?: string;
   reasoning_effort?: string;
+  reasoning?: { summary?: string; generate_summary?: string };
   parallel_tool_calls?: boolean;
 }
 
@@ -5869,12 +5870,39 @@ export function publicCheckpointMetadata(result: Pick<ChatHubResult, "checkpoint
   };
 }
 
-function chatCompletion(model: string, result: ChatHubResult, call: FunctionCall | null, usage: APIUsage = EMPTY_USAGE): Record<string, unknown> {
+/** Chat Completions clients opt out with reasoning.summary "none"; every
+ * other request delivers verified public summaries when ChatHub emitted any.
+ * The summaries are never manufactured — absent upstream text means absent
+ * reasoning_content, exactly like the Responses route. */
+export function chatDeliversPublicReasoning(reasoning: ChatBody["reasoning"]): boolean {
+  if (!reasoning) return true;
+  const mode = reasoning.summary === undefined ? reasoning.generate_summary : reasoning.summary;
+  return mode !== "none";
+}
+
+export function chatReasoningContent(result: ChatHubResult): string | undefined {
+  if (!result.publicReasoningSummary?.length) return undefined;
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  let remaining = 16_384;
+  for (const text of result.publicReasoningSummary) {
+    if (typeof text !== "string" || !text.trim() || seen.has(text) || text.length > remaining) continue;
+    seen.add(text);
+    parts.push(text);
+    remaining -= text.length;
+  }
+  return parts.length ? parts.join("\n\n") : undefined;
+}
+
+function chatCompletion(model: string, result: ChatHubResult, call: FunctionCall | null, usage: APIUsage = EMPTY_USAGE, reasoningContent?: string): Record<string, unknown> {
   const created = Math.floor(Date.now() / 1000);
   const safeCall = publicFunctionCall(call);
-  const message = safeCall
-    ? { role: "assistant", content: null, tool_calls: [{ id: `call_${crypto.randomUUID().replaceAll("-", "")}`, type: "function", function: safeCall }] }
-    : { role: "assistant", content: assistantVisibleText(result) };
+  const message = {
+    ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+    ...(safeCall
+      ? { role: "assistant", content: null, tool_calls: [{ id: `call_${crypto.randomUUID().replaceAll("-", "")}`, type: "function", function: safeCall }] }
+      : { role: "assistant", content: assistantVisibleText(result) }),
+  };
   return {
     id: `chatcmpl_${crypto.randomUUID().replaceAll("-", "")}`,
     object: "chat.completion",
@@ -5917,6 +5945,7 @@ function chatStream(
   downstreamSignal?: AbortSignal,
   metrics?: RequestMetricTracker,
   freshToolResult = false,
+  deliverPublicReasoning = true,
 ): Response {
   const id = `chatcmpl_${crypto.randomUUID().replaceAll("-", "")}`;
   const created = Math.floor(Date.now() / 1000);
@@ -5976,6 +6005,10 @@ function chatStream(
             portableAssistantResult(result, safeCall),
           );
           await completeChatFinalTurn(session, lease, result, finalTail, completionLedger);
+          if (deliverPublicReasoning) {
+            const reasoningContent = chatReasoningContent(result);
+            if (reasoningContent) send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { reasoning_content: reasoningContent }, finish_reason: null }] });
+          }
           if (safeCall) {
             send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `call_${crypto.randomUUID().replaceAll("-", "")}`, type: "function", function: safeCall }] }, finish_reason: null }] });
           } else if (bufferTools) {
@@ -6143,7 +6176,7 @@ async function chatCompletions(request: Request, env: Env, metrics?: RequestMetr
     promptLimit,
     promptTokenLimit,
   );
-  if (parsed.stream) return chatStream(env, session, lease, account, prompt, currentTurnPrompt, model, tone, parsed.tools, parsed.tool_choice, attachments, ledger, completionLedger, accountRouteRecoveryPrompt, deadlineAt, request.signal, metrics, freshToolResult);
+  if (parsed.stream) return chatStream(env, session, lease, account, prompt, currentTurnPrompt, model, tone, parsed.tools, parsed.tool_choice, attachments, ledger, completionLedger, accountRouteRecoveryPrompt, deadlineAt, request.signal, metrics, freshToolResult, chatDeliversPublicReasoning(parsed.reasoning));
   try {
     const turn = await resolveAssistantTurn(env, session, lease, account, prompt, tone, parsed.tools, parsed.tool_choice, attachments, ledger, completionLedger, undefined, request.signal, undefined, deadlineAt, metrics, accountRouteRecoveryPrompt, freshToolResult);
     const { call, result } = turn;
@@ -6158,7 +6191,7 @@ async function chatCompletions(request: Request, env: Env, metrics?: RequestMetr
     // execution ledger. Otherwise a plain follow-up with no tool result would
     // overwrite the durable snapshot with [] and long tasks would lose proof.
     await completeChatFinalTurn(session, lease, result, finalTail, completionLedger);
-    return Response.json(chatCompletion(model, result, call, metrics?.usage()), { headers: { "Cache-Control": "no-store" } });
+    return Response.json(chatCompletion(model, result, call, metrics?.usage(), chatDeliversPublicReasoning(parsed.reasoning) ? chatReasoningContent(result) : undefined), { headers: { "Cache-Control": "no-store" } });
   } catch (cause) {
     await abandonUnseenTurn(session, lease.leaseId, unseenCheckpoint);
     throw cause;
@@ -7355,12 +7388,12 @@ async function responsesCore(
     promptLimit,
     promptTokenLimit,
   );
-  if (parsed.stream) return responsesStream(env, session, lease, account, prompt, currentTurnPrompt, portableBaseTail, model, tone, responseId, responseSessionKey, parsed.tools, parsed.tool_choice, attachments, ledger, accountRouteRecoveryPrompt, deadlineAt, responseBranch, signal, metrics, outputs.length > 0, streamLifecycle, requestsPublicReasoning(parsed.reasoning));
+  if (parsed.stream) return responsesStream(env, session, lease, account, prompt, currentTurnPrompt, portableBaseTail, model, tone, responseId, responseSessionKey, parsed.tools, parsed.tool_choice, attachments, ledger, accountRouteRecoveryPrompt, deadlineAt, responseBranch, signal, metrics, outputs.length > 0, streamLifecycle, publicReasoningWithDefault(parsed.reasoning));
   try {
     const turn = await resolveAssistantTurn(env, session, lease, account, prompt, tone, parsed.tools, parsed.tool_choice, attachments, ledger, ledger, undefined, signal, undefined, deadlineAt, metrics, accountRouteRecoveryPrompt, outputs.length > 0);
     const { call, result } = turn;
     markCheckpointMetric(metrics, result);
-    const output = appendPublicReasoning(responseOutput(responseId, result, call, parsed.tools), result.publicReasoningSummary, requestsPublicReasoning(parsed.reasoning));
+    const output = appendPublicReasoning(responseOutput(responseId, result, call, parsed.tools), result.publicReasoningSummary, publicReasoningWithDefault(parsed.reasoning));
     if (signal.aborted) throw new Error("REQUEST_ABORTED");
     const finalTail = appendPortableProtocolTurn(portableBaseTail, currentTurnPrompt, portableAssistantResult(result, call));
     await completeFinalTurn(session, lease, result, finalTail, ledger);

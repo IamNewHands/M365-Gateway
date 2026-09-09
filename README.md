@@ -110,6 +110,14 @@ GPT-6 Astra / Claude Fable 5.1 的官方发布信息、M365 产品范围和待�
 
 `gpt-5.6-sol` 在未指定 reasoning effort 时使用低延迟 Chat 路由；需要更深推理时显式请求 `reasoning_effort=medium/high` 或使用 `gpt-5.6-reasoning`。模型目录只保留已验证的六个稳定路由，不再宣传未完成租户验收的 quick、Terra、旧版 GPT 或 Fable/Opus 候选。Microsoft 偶尔会用 HTTP 200 包装容量占位句，网关会将已识别的占位句转换为可重试的 429，避免把“无工具调用”的假成功交给 Codex/OpenCode。
 
+### 公开推理摘要投递（Responses 与 Chat Completions）
+
+Microsoft 官方在 ChatHub 上公开显示的推理摘要（`ChainOfThoughtSummary`）会被网关原样捕获，绝不从回答文本、工具进度或代码伪造。投递语义：
+
+- `/v1/responses`：默认随响应附加以 `reasoning` output item 形式的已验证公开摘要（`end_of_turn` 一次性送达，不逐 token 流式）。客户端可用 `reasoning.summary: "none"` 显式退出；`auto`/`concise`/`detailed` 仍然有效。
+- `/v1/chat/completions`：默认以 DeepSeek 风格的 `reasoning_content` 字段投递同一批摘要——非流式在 `choices[0].message.reasoning_content`，流式在 finish_reason 之前发送一个 `delta.reasoning_content` chunk。客户端可用 `reasoning.summary: "none"` 显式退出。摘要缺席（未获上游摘要的模型或轮次）时字段完全省略。
+- 仅 `gpt-5.6-sol` 与 `gpt-5.6-reasoning` 有已验证的公开摘要来源；其余模型即使请求也不会收到合成内容。
+
 ## 本地验证
 
 要求 Node.js 20 或更高版本。
