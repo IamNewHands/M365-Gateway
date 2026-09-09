@@ -2319,6 +2319,12 @@ export async function accountForLease(
     if (!lease.accountId) Object.assign(lease, await session.bindAccount(lease.leaseId, selection.accountId));
     return { account: selection, rebound: false };
   }
+  if (lease.accountId) {
+    // Session spread: a lease bound to a healthy non-route account keeps its
+    // own lane across turns instead of being forced back onto the route.
+    const bound = await state.selectBoundSpreadAccount(lease.accountId);
+    if (bound) return { account: bound, rebound: false };
+  }
 
   const hasPortableRecovery = hasPortableAccountRecovery(lease);
   if (lease.accountId && lease.accountLocked && hasPortableRecovery) {
