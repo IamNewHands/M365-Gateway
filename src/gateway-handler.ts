@@ -224,8 +224,17 @@ async function adminRoute(request: Request, env: Env, url: URL): Promise<Respons
       sessionTTL: "24 hours",
       adminSessionTTL: "24 hours",
       chatSessionTTL: "30 days",
+      accountSpread: await tenant(env).isAccountSpreadEnabled(),
       capabilities: CAPABILITY_MATRIX,
     } });
+    if (request.method === "POST") {
+      const body = await jsonBody<{ accountSpread?: unknown }>(request);
+      if (body.accountSpread === undefined) return error(501, "not_implemented", "runtime settings editing is not available in the preview build");
+      if (typeof body.accountSpread !== "boolean") {
+        return error(400, "invalid_account_spread", "accountSpread must be a boolean");
+      }
+      return json({ accountSpread: await tenant(env).setAccountSpreadEnabled(body.accountSpread) });
+    }
     return error(501, "not_implemented", "runtime settings editing is not available in the preview build");
   }
   if (url.pathname === "/api/admin/debug/logs" && request.method === "GET") {

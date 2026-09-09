@@ -120,6 +120,10 @@ export interface AccountSelection {
   /** Persisted routing generation. Useful to reject stale failure reports. */
   routeEpoch: number;
   token: OAuthTokenSet;
+  /** True when the session-spread switch chose this account outside the
+   * global single-active route. Its upstream gate skips route ownership
+   * checks and its health accounting is account-local. */
+  spread?: boolean;
 }
 
 interface ActiveAccountRoute {
@@ -448,9 +452,9 @@ export class TenantState extends DurableObject<Env> {
     }
   }
 
-  private orderedAvailableAccounts(afterSequence = Number.NEGATIVE_INFINITY): Array<{ id: string; sequence_no: number }> {
-    const rows = this.ctx.storage.sql.exec<{ id: string; sequence_no: number }>(
-      "SELECT id,sequence_no FROM accounts ORDER BY sequence_no,id",
+  private orderedAvailableAccounts(afterSequence = Number.NEGATIVE_INFINITY): Array<{ id: string; sequence_no: number; egress_type: string }> {
+    const rows = this.ctx.storage.sql.exec<{ id: string; sequence_no: number; egress_type: string }>(
+      "SELECT id,sequence_no,egress_type FROM accounts ORDER BY sequence_no,id",
     ).toArray().filter((row) => this.accountAvailabilityRow(row.id).available);
     if (rows.length === 0) return [];
     const after = rows.filter((row) => row.sequence_no > afterSequence);
@@ -829,6 +833,33 @@ export class TenantState extends DurableObject<Env> {
     };
   }
 
+  /** Session-spread switch (default off). When enabled, fresh client sessions
+   * are distributed across every healthy account in round-robin order instead
+   * of all sharing the single global active route. Existing sessions keep
+   * their bound account; failover still converges on the global route. */
+  async isAccountSpreadEnabled(): Promise<boolean> {
+    return this.spreadEnabled();
+  }
+
+  private spreadEnabled(): boolean {
+    return this.meta("account_spread_enabled") === "1";
+  }
+
+  async setAccountSpreadEnabled(enabled: boolean): Promise<boolean> {
+    this.setMeta("account_spread_enabled", enabled ? "1" : "0");
+    this.setMeta("account_spread_cursor", "0");
+    return this.spreadEnabled();
+  }
+
+  private spreadCursor(): number {
+    return Number.parseInt(this.meta("account_spread_cursor") ?? "0", 10) || 0;
+  }
+
+  private rotateSpreadCursor(rows: number): void {
+    if (rows <= 0) return;
+    this.setMeta("account_spread_cursor", String((this.spreadCursor() + 1) % rows));
+  }
+
   async selectAccount(preferredAccountId = "", excludedAccountIds: string[] = []): Promise<AccountSelection | null> {
     const preferred = preferredAccountId.trim();
     const excluded = new Set(excludedAccountIds.slice(0, 128).map((id) => id.trim()).filter(Boolean));
@@ -836,6 +867,13 @@ export class TenantState extends DurableObject<Env> {
     // confirmed pre-submit account failure, its immediate successor. Never
     // expose a third account to the same request.
     if (!preferred && excluded.size >= 2) return null;
+    // Session spread: fresh client sessions rotate across the healthy pool.
+    // Failover requests (excluded set non-empty) deliberately keep the global
+    // route so bounded recovery semantics stay exactly as documented.
+    if (!preferred && excluded.size === 0 && this.spreadEnabled()) {
+      const spread = await this.selectSpreadAccount();
+      if (spread) return spread;
+    }
     const route = this.ensureActiveAccountRoute();
     if (!route.accountId || (preferred && preferred !== route.accountId) || excluded.has(route.accountId)) return null;
     const selected = this.ctx.storage.sql.exec<AccountRow>(
@@ -877,6 +915,72 @@ export class TenantState extends DurableObject<Env> {
     }
   }
 
+  /**
+   * Session-spread selection: rotate a persisted cursor across every healthy
+   * account and hand the first credential that verifies to the new session.
+   * The global active route stays untouched 鈥?spread lanes run in parallel
+   * with it, and per-account upstream gates already serialize each lane.
+   * Bounded by the pool size: a run of broken credentials cools those
+   * accounts down through reportAccountFailure and the walk terminates.
+   */
+  private async selectSpreadAccount(): Promise<AccountSelection | null> {
+    const rows = this.orderedAvailableAccounts();
+    if (rows.length === 0) return null;
+    const route = this.ensureActiveAccountRoute();
+    const offset = this.spreadCursor() % rows.length;
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[(offset + index) % rows.length];
+      try {
+        const token = await this.ensureValidAccount(row.id);
+        if (!token) {
+          await this.reportAccountFailure(row.id, "permanent");
+          continue;
+        }
+        this.rotateSpreadCursor(rows.length);
+        return {
+          accountId: row.id,
+          sequence: row.sequence_no,
+          egress: this.safeEgress(row.egress_type),
+          routeEpoch: route.epoch,
+          token,
+          spread: true,
+        };
+      } catch (cause) {
+        const disposition = classifyAccountFailure(cause);
+        if (!disposition) throw cause;
+        await this.reportAccountFailure(row.id, disposition.kind);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Re-select a session's bound account without the single-route ownership
+   * fence. Only spread-enabled deployments with a healthy bound account
+   * qualify; everything else returns null so the caller keeps its existing
+   * failover semantics. The global route is never advanced here.
+   */
+  async selectBoundSpreadAccount(accountId: string): Promise<AccountSelection | null> {
+    const id = accountId.trim();
+    if (!id || !this.spreadEnabled()) return null;
+    const route = this.ensureActiveAccountRoute();
+    const row = this.ctx.storage.sql.exec<{ id: string; sequence_no: number; egress_type: string }>(
+      "SELECT id,sequence_no,egress_type FROM accounts WHERE id=?",
+      id,
+    ).toArray()[0];
+    if (!row || !this.accountAvailabilityRow(id).available) return null;
+    const token = await this.ensureValidAccount(id);
+    if (!token) return null;
+    return {
+      accountId: id,
+      sequence: row.sequence_no,
+      egress: this.safeEgress(row.egress_type),
+      routeEpoch: route.epoch,
+      token,
+      spread: true,
+    };
+  }
+
   async reportAccountFailure(accountId: string, kind: AccountFailureKind, expectedRouteEpoch?: number): Promise<AccountAvailability> {
     const id = accountId.trim();
     if (!id) throw new Error("ACCOUNT_ID_REQUIRED");
@@ -888,7 +992,12 @@ export class TenantState extends DurableObject<Env> {
       // Health and routing are one generation-scoped transaction. Mutating
       // health for a stale generation would make a later read advance even
       // though the CAS itself correctly rejected that failure.
-      if (route.accountId !== id || (expectedRouteEpoch !== undefined && route.epoch !== expectedRouteEpoch)) {
+      if (route.accountId !== id) {
+        // Session-spread lanes run outside the single-active route; their
+        // health is account-local and must be recorded even though the route
+        // CAS below will (correctly) no-op for a non-route account.
+        if (!this.spreadEnabled()) return this.accountAvailabilityRow(id);
+      } else if (expectedRouteEpoch !== undefined && route.epoch !== expectedRouteEpoch) {
         return this.accountAvailabilityRow(id);
       }
       const now = Date.now();
@@ -930,7 +1039,7 @@ export class TenantState extends DurableObject<Env> {
     // A response from a retired account may arrive after a sibling request has
     // already switched the route. It must not erase the confirmed failure that
     // caused that switch. Re-authorization explicitly opts in below.
-    if (!allowInactive && this.ensureActiveAccountRoute().accountId !== id) return;
+    if (!allowInactive && this.ensureActiveAccountRoute().accountId !== id && !this.spreadEnabled()) return;
     const now = Date.now();
     this.ctx.storage.sql.exec(
       `INSERT INTO account_health(account_id,state,failure_kind,failure_count,cooldown_until,last_failure_at,updated_at)
@@ -951,16 +1060,24 @@ export class TenantState extends DurableObject<Env> {
       const stored = this.ctx.storage.sql.exec<{ found: number }>("SELECT 1 AS found FROM accounts WHERE id=?", id).toArray()[0];
       if (!stored) return { ok: false, leaseId: "", retryAfterMs: 0, code: "ACCOUNT_MISSING" };
       const route = this.ensureActiveAccountRoute();
-      if (route.accountId !== id || (expectedRouteEpoch !== undefined && route.epoch !== expectedRouteEpoch)) {
-        return { ok: false, leaseId: "", retryAfterMs: 0, code: "ACCOUNT_NOT_ACTIVE" };
+      if (route.accountId === id) {
+        if (expectedRouteEpoch !== undefined && route.epoch !== expectedRouteEpoch) {
+          return { ok: false, leaseId: "", retryAfterMs: 0, code: "ACCOUNT_NOT_ACTIVE" };
+        }
+        return null;
       }
-      return null;
+      // Session-spread lanes: a healthy non-route account is a legitimate
+      // parallel lane. Its per-account gate still provides full FIFO
+      // serialization and 1s spacing; only the single-route ownership fence
+      // is lifted, and only while the switch is on and health allows.
+      if (this.spreadEnabled() && this.accountAvailabilityRow(id).available) return null;
+      return { ok: false, leaseId: "", retryAfterMs: 0, code: "ACCOUNT_NOT_ACTIVE" };
     };
     let rejected = routeRejection();
     if (rejected) return rejected;
     await this.expireUpstreamWaiters(now);
     // expireUpstreamWaiters is an RPC-visible await boundary. Recheck the route
-    // generation so an A→B→A transition cannot acquire with stale coordinates.
+    // generation so an A鈫払鈫扐 transition cannot acquire with stale coordinates.
     rejected = routeRejection();
     if (rejected) return rejected;
     if (waiter) {
@@ -1782,20 +1899,33 @@ export class TenantState extends DurableObject<Env> {
     return token;
   }
 
+  /**
+   * Token fencing: the global active route always qualifies. With the
+   * session-spread switch on, any currently healthy account qualifies too 鈥?
+   * spread lanes ARE active lanes, refreshed lazily on request (the alarm
+   * proactively refreshes only the route account). Keeping the availability
+   * check here means an account isolated between selection and use fails
+   * closed instead of silently reading a retired credential.
+   */
+  private canUseAccountToken(accountId: string): boolean {
+    if (this.activeAccountRoute().accountId === accountId) return true;
+    return this.spreadEnabled() && this.accountAvailabilityRow(accountId).available;
+  }
+
   async ensureValidAccount(id = "", forceRefresh = false): Promise<OAuthTokenSet | null> {
     const route = this.ensureActiveAccountRoute();
     const accountId = id.trim() || route.accountId;
     if (!accountId) return null;
-    if (accountId !== route.accountId) throw new Error("ACCOUNT_NOT_ACTIVE");
+    if (!this.canUseAccountToken(accountId)) throw new Error("ACCOUNT_NOT_ACTIVE");
     const current = await this.readAccountToken(accountId);
-    if (this.activeAccountRoute().accountId !== accountId) throw new Error("ACCOUNT_NOT_ACTIVE");
+    if (!this.canUseAccountToken(accountId)) throw new Error("ACCOUNT_NOT_ACTIVE");
     if (!current || (!forceRefresh && current.expiresAt > Date.now() + ACTIVE_TOKEN_REFRESH_ADVANCE_MS)) return current;
     let refresh = this.refreshInFlight.get(accountId);
     if (!refresh) {
       refresh = (async () => {
         // Re-read after winning the single-flight slot in case a preceding
         // request refreshed while this RPC was queued.
-        if (this.activeAccountRoute().accountId !== accountId) throw new Error("ACCOUNT_NOT_ACTIVE");
+        if (!this.canUseAccountToken(accountId)) throw new Error("ACCOUNT_NOT_ACTIVE");
         const latest = await this.readAccountToken(accountId);
         if (!latest) throw new Error("NO_ACCOUNT");
         if (!forceRefresh && latest.expiresAt > Date.now() + ACTIVE_TOKEN_REFRESH_ADVANCE_MS) {
@@ -1816,7 +1946,7 @@ export class TenantState extends DurableObject<Env> {
         // A failure on another in-flight request may have switched the route
         // while Microsoft was refreshing. Never persist or return credentials
         // for an account that has since gone to sleep.
-        if (this.activeAccountRoute().accountId !== accountId) throw new Error("ACCOUNT_NOT_ACTIVE");
+        if (!this.canUseAccountToken(accountId)) throw new Error("ACCOUNT_NOT_ACTIVE");
         await this.upsertAccount(fresh, false);
         this.clearTokenRefreshRetry(accountId);
         await this.scheduleNextAlarm();
