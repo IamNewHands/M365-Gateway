@@ -216,14 +216,23 @@ describe("Responses endpoint regressions", () => {
     expect(await next.json()).toMatchObject({ output: [{ type: "message", content: [{ text: "The lookup returned fixture_value_17." }] }] });
   });
 
-  it("does not expose a public summary unless the Responses caller requests it", async () => {
+  it("delivers a verified public summary by default and honors an explicit none opt-out", async () => {
     const auth = await credential();
     installChatHub(({ socket }) => {
       socket.send(`${JSON.stringify({ type: 1, target: "update", arguments: [{ messages: [{ author: "bot", messageType: "Progress", contentOrigin: "ChainOfThoughtSummary", text: "A real optional public summary." }] }] })}${RS}`);
       complete(socket, "normal final answer");
     });
-    const response = await postResponse(auth.apiKey, { input: "hello", reasoning: { effort: "high" } });
-    expect(await response.json()).toMatchObject({ output: [{ type: "message", content: [{ text: "normal final answer" }] }] });
+    const defaulted = await postResponse(auth.apiKey, { input: "hello", reasoning: { effort: "high" } });
+    const delivered = await defaulted.json();
+    expect(delivered).toMatchObject({ output: [{ type: "message", content: [{ text: "normal final answer" }] }, { type: "reasoning" }] });
+    expect(delivered.output.at(-1).summary).toMatchObject([{ type: "summary_text", text: "A real optional public summary." }]);
+
+    installChatHub(({ socket }) => {
+      socket.send(`${JSON.stringify({ type: 1, target: "update", arguments: [{ messages: [{ author: "bot", messageType: "Progress", contentOrigin: "ChainOfThoughtSummary", text: "A real optional public summary." }] }] })}${RS}`);
+      complete(socket, "normal final answer");
+    });
+    const optedOut = await postResponse(auth.apiKey, { input: "hello", reasoning: { effort: "high", summary: "none" } });
+    expect(await optedOut.json()).toMatchObject({ output: [{ type: "message", content: [{ text: "normal final answer" }] }] });
   });
 
   it("preserves arbitrary top-level instructions and user input in the ChatHub prompt", async () => {

@@ -14,6 +14,16 @@ export function requestsPublicReasoning(value: unknown): boolean {
   return mode === "auto" || mode === "concise" || mode === "detailed";
 }
 
+/** Responses-route default: verified public summaries ride along unless the
+ * client explicitly opted out with summary "none". Summaries only exist for
+ * models with verified public delivery, so this stays a no-op elsewhere. */
+export function publicReasoningWithDefault(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return true;
+  const options = value as Record<string, unknown>;
+  const mode = options.summary === undefined ? options.generate_summary : options.summary;
+  return mode !== "none";
+}
+
 export function appendPublicReasoning(
   output: unknown[],
   summaries: readonly string[] | undefined,
