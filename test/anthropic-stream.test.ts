@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { anthropicRequest, convertAnthropicBody } from "../src/anthropic";
 import { modelTone } from "../src/models";
+import { prepareChatMultimodal } from "../src/openai";
 import type { Env } from "../src/types";
 
 const env = {} as Env;
@@ -37,6 +38,76 @@ async function bodyText(response: Response): Promise<string> {
 }
 
 describe("Anthropic streaming compatibility", () => {
+  it("converts Anthropic base64 image blocks into the existing Chat multimodal shape", () => {
+    const converted = convertAnthropicBody({
+      model: "claude-sonnet",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: [
+        { type: "text", text: "What is shown?" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "QUJDRA==" } },
+      ] }],
+    });
+    expect(converted.openAI.messages).toEqual([{ role: "user", content: [
+      { type: "text", text: "What is shown?" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,QUJDRA==", detail: "high" } },
+    ] }]);
+  });
+
+  it("keeps tool results separate when an image follows in the same user turn", () => {
+    const converted = convertAnthropicBody({
+      model: "claude-sonnet",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: [
+        { type: "tool_result", tool_use_id: "tool_1", content: "captured" },
+        { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "/9j/2Q==" } },
+      ] }],
+    });
+    expect(converted.openAI.messages).toEqual([
+      { role: "tool", tool_call_id: "tool_1", content: "captured" },
+      { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/jpeg;base64,/9j/2Q==", detail: "high" } }] },
+    ]);
+  });
+
+  it("preserves images nested in Claude Code tool_result content", () => {
+    const converted = convertAnthropicBody({
+      model: "claude-sonnet",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: [{
+        type: "tool_result",
+        tool_use_id: "tool_image_1",
+        content: [
+          { type: "text", text: "Read 1 file" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "QUJDRA==" } },
+        ],
+      }] }],
+    });
+    expect(converted.openAI.messages).toEqual([{
+      role: "tool",
+      tool_call_id: "tool_image_1",
+      content: [
+        { type: "text", text: "Read 1 file" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,QUJDRA==", detail: "high" } },
+      ],
+    }]);
+    const prepared = prepareChatMultimodal(converted.openAI.messages as Array<Record<string, unknown>>);
+    expect(prepared.attachments).toEqual([{
+      type: "image", url: "data:image/png;base64,QUJDRA==", mimeType: "image/png", detail: "high",
+    }]);
+    expect(prepared.inferenceValue).toEqual([{ role: "tool", tool_call_id: "tool_image_1", content: "Read 1 file" }]);
+    expect(String((prepared.value as Array<Record<string, unknown>>)[0].content)).toContain("[IMAGE ATTACHMENTS PRESENT]");
+  });
+
+  it.each([
+    { type: "url", url: "https://example.com/image.png" },
+    { type: "base64", media_type: "image/svg+xml", data: "PHN2Zz4=" },
+    { type: "base64", media_type: "image/png", data: "" },
+  ])("rejects unsupported Anthropic image sources: %j", (source) => {
+    expect(() => convertAnthropicBody({
+      model: "claude-sonnet", max_tokens: 1024,
+      messages: [{ role: "user", content: [{ type: "image", source }] }],
+    })).toThrow();
+  });
+
   it.each([
     [{ type: "enabled", budget_tokens: 2048 }, undefined, "Claude_Sonnet_Reasoning"],
     [{ type: "adaptive" }, { effort: "low" }, "Claude_Sonnet_Reasoning"],

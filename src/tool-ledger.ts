@@ -409,8 +409,7 @@ function normalizeFailure(value: string): string {
   return normalizeResult(value).toLowerCase().replace(/\d+/gu, "#").slice(0, 1_000);
 }
 
-function structuredFailureStatus(value: unknown): boolean | null {
-  if (!isRecord(value)) return null;
+function directStructuredFailureStatus(value: Record<string, unknown>): boolean | null {
   for (const key of ["exit_code", "exitCode"] as const) {
     const raw = value[key];
     if (typeof raw === "number" && Number.isFinite(raw)) return raw !== 0;
@@ -426,6 +425,49 @@ function structuredFailureStatus(value: unknown): boolean | null {
     if (["ok", "success", "succeeded", "completed", "complete"].includes(status)) return false;
   }
   return null;
+}
+
+/** Code Mode can wrap an exec_command result inside an outer successful
+ * JavaScript cell. Inspect only structured object fields and never parse
+ * stdout/message strings as status, so a fixture mentioning exit_code cannot
+ * manufacture a failure. Any nested command-result failure overrides an outer
+ * `completed` marker. */
+function structuredFailureStatus(value: unknown): boolean | null {
+  let candidate = value;
+  if (typeof candidate === "string") {
+    const trimmed = candidate.trim();
+    if (trimmed.length > 1_000_000 || !/^\{[\s\S]*\}$/u.test(trimmed)) return null;
+    try { candidate = JSON.parse(trimmed) as unknown; } catch { return null; }
+  }
+  if (!isRecord(candidate)) return null;
+
+  let observed = directStructuredFailureStatus(candidate);
+  const visit = (item: unknown, depth: number, budget: { nodes: number }): boolean | null => {
+    budget.nodes += 1;
+    if (depth > 8 || budget.nodes > 2_048 || !isRecord(item)) return null;
+    const commandShape = Object.prototype.hasOwnProperty.call(item, "exit_code")
+      || Object.prototype.hasOwnProperty.call(item, "exitCode")
+      || Object.prototype.hasOwnProperty.call(item, "isError")
+      || Object.prototype.hasOwnProperty.call(item, "is_error")
+      || (Object.prototype.hasOwnProperty.call(item, "status")
+        && ["chunk_id", "session_id", "wall_time_seconds", "output"].some((key) => Object.prototype.hasOwnProperty.call(item, key)));
+    let result = commandShape ? directStructuredFailureStatus(item) : null;
+    for (const [key, child] of Object.entries(item)) {
+      // These fields contain untrusted command/application prose, not wrappers.
+      if (["output", "stdout", "stderr", "text", "content", "message"].includes(key)) continue;
+      const nested = visit(child, depth + 1, budget);
+      if (nested === true) return true;
+      if (nested === false) result = false;
+    }
+    return result;
+  };
+  for (const [key, child] of Object.entries(candidate)) {
+    if (["output", "stdout", "stderr", "text", "content", "message"].includes(key)) continue;
+    const nested = visit(child, 1, { nodes: 0 });
+    if (nested === true) return true;
+    if (nested === false) observed = false;
+  }
+  return observed;
 }
 
 function firstPayloadLine(value: string): string {

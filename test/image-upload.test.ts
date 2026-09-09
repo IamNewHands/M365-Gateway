@@ -5,6 +5,10 @@ import { publicFailure } from "../src/openai";
 import type { OAuthTokenSet } from "../src/types";
 const account = { accessToken: "test-private-token", oid: "11111111-2222-4333-8444-555555555555", tid: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" } as OAuthTokenSet;
 const image = { type: "image" as const, url: "data:image/png;base64,AAAA", mimeType: "image/png", detail: "high" as const };
+async function uploadForm(init: RequestInit | undefined): Promise<FormData> {
+  if (init?.body instanceof FormData) return init.body;
+  return new Response(init?.body, { headers: init?.headers }).formData();
+}
 afterEach(() => vi.restoreAllMocks());
 describe("Microsoft conversation image upload", () => {
   it("logs only an allow-listed success shape without identifiers or URLs", async () => {
@@ -36,7 +40,7 @@ describe("Microsoft conversation image upload", () => {
     await uploadConversationImages(account, "conversation", undefined, new AbortController().signal);
     expect(fetch).not.toHaveBeenCalled();
   });
-  it("uses the official AAD UploadFile routing and image headers without changing multipart bytes", async () => {
+  it("uses the official AAD UploadFile routing and native multipart encoding", async () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
       const headers = new Headers(init?.headers);
       expect(headers.get("X-AnchorMailbox")).toBe(`Oid:${account.oid}@${account.tid}`);
@@ -44,7 +48,8 @@ describe("Microsoft conversation image upload", () => {
       expect(headers.get("X-Scenario")).toBe("officeweb");
       expect(headers.get("Content-Type")).toBeNull();
       expect(headers.get("Authorization")).toBe(`Bearer ${account.accessToken}`);
-      expect((init?.body as FormData).get("FileBase64")).toBe(image.url);
+      expect(init?.body).toBeInstanceOf(FormData);
+      expect((await uploadForm(init)).get("FileBase64")).toBe(image.url);
       return Response.json({ result: { value: "Success" }, conversationId: "conversation", docId: "image-id" });
     });
     await uploadConversationImages(account, "conversation", [image], new AbortController().signal);
@@ -55,7 +60,7 @@ describe("Microsoft conversation image upload", () => {
       expect(url).toBe("https://substrate.office.com/m365Copilot/UploadFile");
       expect(init?.redirect).toBe("manual");
       expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer test-private-token");
-      bodies.push(init?.body as FormData);
+      bodies.push(await uploadForm(init));
       return Response.json({ result: { value: "Success" }, conversationId: "conversation", docId: "image-id" });
     });
     await uploadConversationImages(account, "conversation", [image, image], new AbortController().signal);
@@ -65,6 +70,17 @@ describe("Microsoft conversation image upload", () => {
     expect(bodies[0].get("scenario")).toBe("UploadImage");
     expect(bodies[0].getAll("optionsSets")).toHaveLength(3);
     expect(bodies[0].getAll("optionsSets")).toContain(MULTI_IMAGE_UPLOAD_OPTION);
+  });
+  it("keeps a large inline image intact in native multipart data", async () => {
+    const largeImage = { ...image, url: `data:image/png;base64,${"A".repeat(160_000)}` };
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const form = await uploadForm(init);
+      expect(init?.body).toBeInstanceOf(FormData);
+      expect(form.get("FileBase64")).toBe(largeImage.url);
+      expect(form.getAll("optionsSets")).toEqual(["cwcgptvsan", MULTI_IMAGE_UPLOAD_OPTION, "gptvnorm2048"]);
+      return Response.json({ result: { value: "Success" }, conversationId: "conversation", docId: "image-id" });
+    });
+    await uploadConversationImages(account, "conversation", [largeImage], new AbortController().signal);
   });
   it.each([
     "https://substrate.office.com/images/file-1?signature=test",
@@ -126,9 +142,10 @@ describe("uploaded image references on the actual ChatHub wire", () => {
       const url = new URL(typeof input === "string" ? input : input instanceof Request ? input.url : String(input));
       if (url.hostname !== "substrate.office.com") throw new Error("unexpected outbound request in offline image test");
       if (url.pathname === "/m365Copilot/UploadFile") {
-        const conversationId = String((init?.body as FormData).get("conversationId"));
+        const form = await uploadForm(init);
+        const conversationId = String(form.get("conversationId"));
         const docId = `verified-image-${uploads.length + 1}`;
-        uploads.push({ conversationId, docId, bytes: String((init?.body as FormData).get("FileBase64")), optionsSets: (init?.body as FormData).getAll("optionsSets") });
+        uploads.push({ conversationId, docId, bytes: String(form.get("FileBase64")), optionsSets: form.getAll("optionsSets") });
         if (options.secondUploadFails && uploads.length === 2) return Response.json({ result: { value: "Failure" }, conversationId });
         return Response.json({ result: { value: "Success" }, conversationId, docId, fileUrl: options.fileUrl });
       }
@@ -162,11 +179,9 @@ describe("uploaded image references on the actual ChatHub wire", () => {
     const invocation = wire.invocations[0];
     expect(invocation.message.imageUrl).toBeUndefined();
     expect(invocation.queryAnnotations).toBeUndefined();
-    expect(invocation.message.queryAnnotations).toBeUndefined();
     expect(invocation.message.attachments).toBeUndefined();
     expect(invocation.message.messageAnnotations).toEqual([{
       id: wire.uploads[0].docId,
-      url: fileUrl,
       messageAnnotationMetadata: {
         "@type": "File",
         annotationType: "File",
@@ -175,6 +190,7 @@ describe("uploaded image references on the actual ChatHub wire", () => {
       },
       messageAnnotationType: "ImageFile",
     }]);
+    expect(invocation.message.queryAnnotations).toBeUndefined();
     expect(invocation.message.entityAnnotationTypes).toEqual(["People", "File", "Event", "Email", "TeamsMessage"]);
     expect(invocation.optionsSets).toContain("cwcfluxgptv");
     expect(invocation.optionsSets).not.toContain("cwcgptv");
@@ -187,7 +203,8 @@ describe("uploaded image references on the actual ChatHub wire", () => {
     expect(new Set(invocation.optionsSets).size).toBe(invocation.optionsSets.length);
     expect(invocation.optionsSets).toContain(MULTI_IMAGE_UPLOAD_OPTION);
     expect(wire.uploads[0].optionsSets).toContain(MULTI_IMAGE_UPLOAD_OPTION);
-    expect(wire.urls[0].searchParams.get("variants")?.split(",")).toContain("cdxodimgupload");
+    expect(wire.urls[0].searchParams.has("variants")).toBe(true);
+    expect(wire.urls[0].searchParams.has("X-variants")).toBe(false);
     expect(JSON.stringify(invocation)).not.toContain("data:image/");
     expect(invocation.conversationId).toBe(wire.uploads[0].conversationId);
     expect(invocation.message.text).toBe(request.text);
@@ -207,7 +224,6 @@ describe("uploaded image references on the actual ChatHub wire", () => {
     const invocation = wire.invocations[0];
     expect(invocation.message.imageUrl).toBeUndefined();
     expect(invocation.queryAnnotations).toBeUndefined();
-    expect(invocation.message.queryAnnotations).toBeUndefined();
     expect(invocation.message.attachments).toBeUndefined();
     expect(invocation.message.messageAnnotations).toEqual(wire.uploads.map(upload => ({
       id: upload.docId,
@@ -219,6 +235,7 @@ describe("uploaded image references on the actual ChatHub wire", () => {
       },
       messageAnnotationType: "ImageFile",
     })));
+    expect(invocation.message.queryAnnotations).toBeUndefined();
     expect(invocation.optionsSets).toContain("flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch");
     expect(JSON.stringify(invocation)).not.toContain("data:image/");
   });
@@ -236,6 +253,8 @@ describe("uploaded image references on the actual ChatHub wire", () => {
     expect(wire.invocations[0].message.entityAnnotationTypes).toBeUndefined();
     expect(wire.invocations[0].message.text).toBe(request.text);
     expect(wire.urls[0].searchParams.get("variants")?.split(",")).not.toContain("cdxodimgupload");
+    expect(wire.urls[0].searchParams.get("variants")?.split(",")).not.toContain("agt_module_enableImageUploadFromOD");
+    expect(wire.urls[0].searchParams.has("X-variants")).toBe(false);
     expect(wire.urls[0].searchParams.get("XRoutingParameterSessionKey")).toBe(wire.urls[0].searchParams.get("chatsessionid"));
   });
 
@@ -247,9 +266,9 @@ describe("uploaded image references on the actual ChatHub wire", () => {
     expect(wire.invocations).toHaveLength(1);
     expect(wire.invocations[0].conversationId).toBe(wire.uploads[0].conversationId);
     expect(wire.invocations[0].message.imageUrl).toBeUndefined();
-    expect(wire.invocations[0].message.queryAnnotations).toBeUndefined();
     expect(wire.invocations[0].message.attachments).toBeUndefined();
     expect(wire.invocations[0].message.messageAnnotations).toMatchObject([{ id: wire.uploads[0].docId }]);
+    expect(wire.invocations[0].message.queryAnnotations).toBeUndefined();
     expect(wire.urls[1].searchParams.get("XRoutingParameterSessionKey")).toBe(wire.urls[1].searchParams.get("chatsessionid"));
   });
 
@@ -263,9 +282,9 @@ describe("uploaded image references on the actual ChatHub wire", () => {
     expect(wire.uploads[0].docId).not.toBe(wire.uploads[1].docId);
     for (const [index, invocation] of wire.invocations.entries()) {
       expect(invocation.conversationId).toBe(request.conversationId);
-      expect(invocation.message.queryAnnotations).toBeUndefined();
       expect(invocation.message.attachments).toBeUndefined();
       expect(invocation.message.messageAnnotations).toMatchObject([{ id: wire.uploads[index].docId }]);
+      expect(invocation.message.queryAnnotations).toBeUndefined();
       expect(invocation.optionsSets).toContain(MULTI_IMAGE_UPLOAD_OPTION);
     }
   });

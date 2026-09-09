@@ -1,34 +1,48 @@
 {
-  "release": "m365-gateway-public-source-2026-09-08",
-  "createdAt": "2026-09-08T04:19:50.769Z",
-  "sourceOfTruth": "Sanitized local canonical source; not a downloaded production bundle",
-  "sourceStatus": "sanitized_local_source",
-  "validation": {
-    "canonicalCheck": {
-      "status": "passed",
-      "testFiles": 25,
-      "tests": 466,
-      "logSha256": "2eaed001357509eba7e3d74a0007013cc69211658d467fa37680e669b840080b"
-    },
-    "stageCheck": {
-      "status": "passed",
-      "testFiles": 25,
-      "tests": 466,
-      "logSha256": "41d08240b9e8f3ac02fbf385c0080f5da3d11602e3fd52fd45424ba50ff1dd60"
-    },
-    "vision": "not_live_verified"
+  "release": "2026.09.09-cf4-source",
+  "createdAt": "2026-09-09T02:25:30.867Z",
+  "sourceKind": "sanitized-maintained-source",
+  "deployedByThisExport": false,
+  "productionArtifactEquivalent": true,
+  "productionDeployment": {
+    "target": "CF4",
+    "workerVersion": "44bf8859-1fef-40d0-a246-cc60cc013f90",
+    "pulledArtifactSha256": "8251A3AD0AD620C051DC18CA0E8B559C920F557A407637E2B5BB81B6728C7F25",
+    "pulledArtifactBytes": 748828,
+    "note": "This sanitized package was generated from the maintained source used for that deployment; its files are source, not the compiled Worker artifact."
   },
-  "deployment": {
-    "status": "not_deployed",
-    "note": "This archive does not assert a production deployment or live Microsoft 365 vision acceptance."
+  "sourceValidation": {
+    "status": "passed",
+    "typecheck": "passed",
+    "testFiles": 25,
+    "tests": 479,
+    "cloudflareDryRun": "passed"
   },
-  "license": {
-    "status": "not_declared",
-    "note": "No open-source license grant is supplied by this package; licensing remains to be confirmed."
+  "publicPackageValidation": "passed",
+  "license": "not-declared-see-LICENSE-NOTICE.md",
+  "imageVisionAcceptance": "not-verified-live-upload-previously-returned-403",
+  "includedCapabilities": {
+    "modelCatalog": [
+      "gpt-5.5",
+      "gpt-5.5-reasoning",
+      "gpt-5.6-sol",
+      "gpt-5.6-reasoning",
+      "gpt-6-astra",
+      "claude-sonnet",
+      "claude-sonnet-reasoning"
+    ],
+    "gpt6AstraRoute": "Gpt_6_Astra",
+    "protocols": [
+      "OpenAI Chat Completions",
+      "OpenAI Responses",
+      "Anthropic Messages"
+    ],
+    "cloudflareRuntime": [
+      "Workers",
+      "KV",
+      "Durable Objects",
+      "Static Assets"
+    ]
   },
-  "integrity": {
-    "algorithm": "SHA-256",
-    "manifest": "SHA256SUMS",
-    "scope": "Every archive file except SHA256SUMS itself; the archive hash is returned separately."
-  }
+  "privateDeploymentDataIncluded": false
 }

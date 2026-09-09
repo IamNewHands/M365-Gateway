@@ -1,5 +1,7 @@
-# 许可证状态
+# License notice
 
-当前维护源码没有提供可核验的项目 LICENSE。本包没有擅自追加 MIT、Apache 或其他开源授权，也不改变第三方依赖各自的许可证。
+This package contains the complete maintainable source selected for public review.
 
-此包是经过脱敏的源码交付包。对外宣布采用开源许可证或允许他人使用、修改、再分发之前，权利人需要核对原项目来源与授权，并明确适用许可证。敏感信息扫描通过不等于获得发布授权。
+No open-source license has been declared by the project owner yet. Source availability
+does not by itself grant permission to redistribute, sublicense, or sell the code. Add
+the chosen license file before publishing this package as OSI-approved open source.

@@ -19,7 +19,7 @@ interface ScriptedInvocation {
   attachments: unknown[];
   imageUrl: unknown;
   queryAnnotations: unknown;
-  messageQueryAnnotations: unknown;
+  messageAnnotations: unknown;
 }
 
 interface TestCredential {
@@ -63,7 +63,7 @@ function installChatHub(
     const url = new URL(typeof input === "string" ? input : input instanceof Request ? input.url : String(input));
     if (url.hostname !== "substrate.office.com") throw new Error(`unexpected outbound fetch: ${url.origin}`);
     if (url.pathname === "/m365Copilot/UploadFile") {
-      const form = init?.body as FormData;
+      const form = await new Response(init?.body, { headers: init?.headers }).formData();
       const conversationId = String(form.get("conversationId"));
       uploads.push({ conversationId, image: String(form.get("FileBase64")) });
       return Response.json({ conversationId, docId: "test-image", result: { value: "Success" } });
@@ -81,7 +81,7 @@ function installChatHub(
       }
       const frame = String(event.data).split(RS).find((part) => part.trim());
       if (!frame) return;
-      const payload = JSON.parse(frame) as { arguments?: Array<{ message?: { text?: string; attachments?: unknown[]; imageUrl?: unknown; queryAnnotations?: unknown }; queryAnnotations?: unknown; plugins?: unknown; toolChoice?: unknown }> };
+      const payload = JSON.parse(frame) as { arguments?: Array<{ message?: { text?: string; attachments?: unknown[]; imageUrl?: unknown; queryAnnotations?: unknown; messageAnnotations?: unknown }; queryAnnotations?: unknown; plugins?: unknown; toolChoice?: unknown }> };
       const invocation = payload.arguments?.[0];
       const prompt = String(invocation?.message?.text ?? "");
       prompts.push(prompt);
@@ -96,7 +96,7 @@ function installChatHub(
         attachments: invocation?.message?.attachments ?? [],
         imageUrl: invocation?.message?.imageUrl,
         queryAnnotations: invocation?.queryAnnotations,
-        messageQueryAnnotations: invocation?.message?.queryAnnotations,
+        messageAnnotations: invocation?.message?.messageAnnotations,
       };
       invocations.push(record);
       script(record);
@@ -289,7 +289,10 @@ describe("Responses endpoint regressions", () => {
     expect(hub.invocations[0]?.attachments).toEqual([]);
     expect(hub.invocations[0]?.imageUrl).toBeUndefined();
     expect(hub.invocations[0]?.queryAnnotations).toBeUndefined();
-    expect(hub.invocations[0]?.messageQueryAnnotations).toBeUndefined();
+    expect(hub.invocations[0]?.messageAnnotations).toMatchObject([{
+      id: "test-image",
+      messageAnnotationType: "ImageFile",
+    }]);
     expect(hub.uploads).toEqual([{ conversationId: hub.urls[0]?.searchParams.get("ConversationId"), image: imageURL }]);
     expect(hub.urls[0]?.searchParams.get("XRoutingParameterSessionKey")).toBe(hub.urls[0]?.searchParams.get("chatsessionid"));
     expect(hub.prompts[0]).not.toContain(imageURL);
@@ -317,7 +320,10 @@ describe("Responses endpoint regressions", () => {
     expect(hub.invocations[0].attachments).toEqual([]);
     expect(hub.invocations[0].imageUrl).toBeUndefined();
     expect(hub.invocations[0].queryAnnotations).toBeUndefined();
-    expect(hub.invocations[0].messageQueryAnnotations).toBeUndefined();
+    expect(hub.invocations[0].messageAnnotations).toMatchObject([{
+      id: "test-image",
+      messageAnnotationType: "ImageFile",
+    }]);
     expect(hub.urls[0]?.searchParams.get("XRoutingParameterSessionKey")).toBe(hub.urls[0]?.searchParams.get("chatsessionid"));
   });
 
@@ -382,7 +388,10 @@ describe("Responses endpoint regressions", () => {
     expect(hub.prompts.at(-1)).not.toContain(imageURL);
     expect(hub.invocations.at(-1)?.imageUrl).toBeUndefined();
     expect(hub.invocations.at(-1)?.queryAnnotations).toBeUndefined();
-    expect(hub.invocations.at(-1)?.messageQueryAnnotations).toBeUndefined();
+    expect(hub.invocations.at(-1)?.messageAnnotations).toMatchObject([{
+      id: "test-image",
+      messageAnnotationType: "ImageFile",
+    }]);
     expect(hub.urls.at(-1)?.searchParams.get("XRoutingParameterSessionKey")).toBe(hub.urls.at(-1)?.searchParams.get("chatsessionid"));
   });
 
@@ -403,7 +412,10 @@ describe("Responses endpoint regressions", () => {
     expect(hub.prompts[0]).not.toContain(imageURL);
     expect(hub.invocations[0]?.imageUrl).toBeUndefined();
     expect(hub.invocations[0]?.queryAnnotations).toBeUndefined();
-    expect(hub.invocations[0]?.messageQueryAnnotations).toBeUndefined();
+    expect(hub.invocations[0]?.messageAnnotations).toMatchObject([{
+      id: "test-image",
+      messageAnnotationType: "ImageFile",
+    }]);
     expect(hub.urls[0]?.searchParams.get("XRoutingParameterSessionKey")).toBe(hub.urls[0]?.searchParams.get("chatsessionid"));
   });
 
