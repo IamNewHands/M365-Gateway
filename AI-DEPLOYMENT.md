@@ -1,33 +1,79 @@
 # AI 部署与维护说明
 
-## 新部署
+## 唯一工作目录
 
-1. 阅读 README.md、CONFIGURATION.md、LICENSE-NOTICE.md。确认有权使用上游账号及发布源码。
-2. 安装当前受支持的 Node.js，运行 `npm ci`。
-3. 运行 `npm run check`，必须等待完整退出码 0，不以测试开始代替成功。
-4. 运行 `npx wrangler login`，用户完成登录后执行 `npx wrangler whoami` 核对邮箱与 Account ID。多账号请为每个账号设置独立 XDG_CONFIG_HOME。
-5. 执行部署器，替换占位参数：
+所有修改、升级、测试、打包和部署只能在以下目录执行：
 
-```powershell
-node deploy-cloudflare.mjs --yes --account-id YOUR_ACCOUNT_ID --name YOUR_WORKER --client-id YOUR_ENTRA_CLIENT_ID --domain api.example.com
+```text
+C:\Users\exampleuser\Desktop\开源\M365-Gateway-CF2
 ```
 
-部署器为新部署创建独立 KV 和加密 Secret。安全保存一次性管理员凭据，通过后台修改初始密码、添加自己授权的 M365 账号并创建客户端 API Key。不要把密钥写入聊天、Git、命令参数或报告。
+任何 AI 或人工操作开始前必须先读取 `AGENTS.md`、`CONFIGURATION.md`、`SOURCE-PROVENANCE.md` 和 `DEPLOYMENT-MANIFEST.json`。不得从旧目录复制单个文件覆盖本目录。
 
-## 更新部署
+## 修改流程
 
-修改源码前检查当前版本和工作区，保留已有修改；补回归测试并执行完整 `npm run check`。使用：
+1. 进入唯一工作目录，确认没有 `.dev.vars`、Token、密码或 API Key 被纳入修改。
+2. 只修改与当前问题有关的源码与测试；先补回归测试，再修实现。
+3. 运行 `npm ci`（依赖未安装或 lockfile 变化时）。
+4. 运行完整门禁：
+
+   ```powershell
+   npm run check
+   ```
+
+5. `check` 必须完整结束并返回 0。只看到 TypeScript、ESLint 或 Vitest 开始运行，不等于通过。
+6. 真实客户端测试按 Codex → OpenCode → Hermes 顺序单独运行。严禁同时运行，避免 CF 免费资源和 Microsoft 账号风控叠加。
+7. 生产部署前再次确认账号、Worker、KV 和域名均与 `CONFIGURATION.md` 一致。
+
+## 更新 CF2
+
+仅在完整检查通过后执行：
 
 ```powershell
-node deploy-cloudflare.mjs --update --yes --account-id YOUR_ACCOUNT_ID --name YOUR_WORKER --client-id YOUR_ENTRA_CLIENT_ID --kv-id YOUR_EXISTING_KV_ID --domain api.example.com
+$env:XDG_CONFIG_HOME='C:\Users\exampleuser\AppData\Roaming\wrangler-cf2'
+node .\deploy-cloudflare.mjs --update --yes --account-id 00000000000000000000000000000000 --name m365-gateway-native-preview --client-id 00000000-0000-4000-8000-000000000001 --kv-id REPLACE_WITH_KV_NAMESPACE_ID --domain gateway.example.com
 ```
 
-更新必须使用同账号原 KV、原加密密钥和原 DO 命名空间。v2 只新增 InferenceGateway，不删除旧 DO。回滚前检查 DO 迁移兼容性，不能用删除命名空间解决回滚报错。
+部署器会：
 
-## 验收
+- 锁定指定 Cloudflare 账号；
+- 校验现有 KV 和必要 Secret；
+- 记录部署前版本；
+- 上传新版本；
+- 检查 `/api/health` 与实际版本；
+- 健康检查失败时自动回滚到先前版本。
 
-核对健康接口实际 Version 与部署回执一致；下载线上 Worker 后计算 SHA-256。串行验证模型发现、Responses 普通 SSE、原生工具调用及大工具结果续接、Chat Completions、Messages、取消后重试。客户端真实小任务也必须单独运行，不并发压测同一上游账号。
+不得用裸 `wrangler deploy` 绕过这些保护。需要 R2 冷归档时，先在同一 CF2 账号创建桶，再额外传入 `--archive-bucket <桶名>`；不要为启用 R2 改动主链路。
 
-API 返回工具调用由客户端本地执行；Gateway 不能直接访问用户 Windows 文件系统。不得用托管下载链接、临时工作区或命令回显冒充本地成功。
+管理员遗失现有后台密码时，使用更新模式的 `--reset-admin-password`，并仅在当前进程的 `M365_ADMIN_PASSWORD` 中提供新值。部署器会上传新的引导密码和一次性恢复版本；Tenant Durable Object 只重写管理员密码哈希、清除旧后台会话与登录失败计数，不删除账号、OAuth、API Key 或聊天状态。禁止把密码写进命令参数、配置文件或本文档。
 
-只读日志与报告不得包含请求正文、工具结果、账号凭据。持续监测 CPU、内存、DO 用量和上游错误；短时健康或单次成功不等于数小时任务验收。
+## 部署后验证
+
+1. 确认部署器报告的新 version ID。
+2. 访问 `https://gateway.example.com/api/health`，确认 HTTP 200 且返回版本与新版本一致。
+3. 单独验证 `/v1/models`、非流式文本、流式文本、Responses 工具调用和续接。
+4. 依次单独运行 Codex、OpenCode、Hermes 的真实小任务；一个完成并保存报告后再运行下一个。
+5. 执行 `node .\scripts\pull-cf2-artifact.mjs`，将线上实际产物重新拉回 `online-artifact/`。
+6. 用新的 version ID 和产物 SHA-256 更新 `DEPLOYMENT-MANIFEST.json`。
+
+## 长任务专项验收
+
+长任务必须覆盖以下场景：
+
+- 上下文压缩后仍保留用户目标、路径、服务器编号和未完成步骤；
+- 工具调用完成后不重复发送完全相同的调用；
+- 工具不可用或返回无效载荷时，改换参数/路径，不循环重试；
+- 客户端本地工具调用保持原生 tool call，不被改造成 ChatHub 托管链接；
+- `previous_response_id`、compaction capsule、断线续接和“已有活动请求”能正确收敛；
+- 不把“命令已回显”误判成“命令已成功执行”；
+- 没有成功工具证据时不声明部署、写入或测试完成。
+
+## 回滚
+
+部署器自动回滚失败时，使用清单中的 `rollbackVersionId`，并先确认账号和 Worker：
+
+```powershell
+npx wrangler rollback a2a501ab-bfa7-4628-922d-28e34a127ec3 --name m365-gateway-native-preview --yes
+```
+
+回滚后仍要检查 `/api/health` 并重新拉取线上产物。不要用旧源码目录覆盖本目录作为“回滚”。

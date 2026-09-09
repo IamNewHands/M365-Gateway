@@ -1435,7 +1435,8 @@ function persistentContent(normalized: NormalizedMultimodalContent): string {
 /**
  * Normalize only the active Chat turn. Image bytes and signed URLs are handed
  * to ChatHub separately and are never copied into prompts, task anchors or the
- * portable session tail. Only user messages may introduce image inputs.
+ * portable session tail. User messages and authenticated tool-result messages
+ * may introduce image inputs; assistant/system media remains invalid.
  */
 export function prepareChatMultimodal(
   messages: Array<Record<string, unknown>>,
@@ -1447,7 +1448,8 @@ export function prepareChatMultimodal(
   }));
   const value = messages.map((message, index) => {
     const content = normalized.contents[index];
-    if (content.attachments.length > 0 && String(message.role ?? "user").toLowerCase() !== "user") {
+    const role = String(message.role ?? "user").toLowerCase();
+    if (content.attachments.length > 0 && role !== "user" && role !== "tool") {
       throw new MultimodalInputError("invalid_multimodal_content");
     }
     return { ...message, content: persistentContent(content) };
@@ -5801,9 +5803,34 @@ export function boundPublicExecFunctionCall(call: FunctionCall | null | undefine
     const sensitiveName = ["exec_command", "write_stdin", "view_image"]
       .some((name) => call.name === name || call.name === clientToolWireName(name));
     if (sensitiveName) return null;
-    return call;
+    return callerProgramIntegrityValid(call) ? call : null;
   }
-  return normalized;
+  return callerProgramIntegrityValid(normalized) ? normalized : null;
+}
+
+/** Reject known transport-corruption residues before caller-side execution.
+ * These tokens are not repaired because guessing the missing PowerShell type
+ * could change the requested operation. Drive paths, URLs and valid `::`
+ * static member access remain byte-for-byte unchanged. */
+function callerProgramIntegrityValid(call: FunctionCall): boolean {
+  if (!["exec", "exec_command", "write_stdin"].includes(call.name)) return true;
+  let parsed: Record<string, unknown>;
+  try {
+    const value = JSON.parse(call.arguments) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    parsed = value as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  const source = call.name === "exec"
+    ? parsed.input
+    : call.name === "write_stdin"
+      ? parsed.chars
+      : parsed.cmd;
+  if (typeof source !== "string") return false;
+  const orphanedStaticMember = /(^|[^A-Za-z0-9_\]:]):(?:NewLine|IndexOf|LastIndexOf|Max|Min|Matches|Match|Escape|Unescape|Join|Concat|Combine|GetFullPath|GetFileName|GetDirectoryName|IsNullOrEmpty|IsNullOrWhiteSpace|Parse|TryParse|FromBase64String|ToBase64String)\b/u;
+  const singleColonAfterType = /\[[A-Za-z_][A-Za-z0-9_.+`,\[\] ]*\]:(?!:)[A-Za-z_]/u;
+  return !orphanedStaticMember.test(source) && !singleColonAfterType.test(source);
 }
 
 function publicFunctionCall(call: FunctionCall | null | undefined): FunctionCall | null {

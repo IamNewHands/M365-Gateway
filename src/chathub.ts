@@ -104,7 +104,6 @@ const CHAT_PROGRESS_IDLE_TIMEOUT_MS = 90_000;
 // consuming most of the client's idle window before any invocation exists.
 const CHAT_HANDSHAKE_TIMEOUT_MS = 15_000;
 const VARIANTS = "EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableLuForChatCIQ,feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,feature.enablechatpages,feature.enableCodeCanvas,feature.turnOnWorkTabRecommendation,turnOffWorkTabUpsellFromClient,feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,feature.EnableDeduplicatingSourceAttributions,Enable3PActionProgressMessages,feature.enableClientWebRtc,feature.EnableMeetingRecapOfSeriesMeetingWithCiq,feature.EnableReferencesListCompleteSignal,feature.StorageMessageSplitDisabled,feature.EnableCuaTakeControlApi,feature.cwcallowedos,feature.disabledisallowedmsgs,feature.enableCitationsForSynthesisData,feature.enableGenerateGraphicArtOptionsSet,cdximagen,feature.EnableUpdatedUXForConfirmationDialog,feature.EnableClientFileURLSupportForOfficeWebPaidCopilot,feature.EnableDesignEditorImageGrounding,feature.EnableDesignerEditor,feature.OfficeWebToHelix,feature.OfficeDesktopToHelix,feature.M365TeamsHubToHelix,feature.OwaHubToHelix,feature.MonarchHubToHelix,feature.Win32OutlookHubToHelix,feature.MacOutlookHubToHelix,Agt_bizchat_enableGpt5ForHelix";
-const IMAGE_FILE_VARIANT = "cdxodimgupload";
 
 export interface ChatHubRequest {
   text: string;
@@ -215,13 +214,13 @@ function relayOrigin(value: string): string {
   return url.origin;
 }
 
-function relayTargetQuery(sessionId: string, conversationId: string, requestId: string, imageFiles = false): string {
+function relayTargetQuery(sessionId: string, conversationId: string, requestId: string, _imageFiles = false): string {
   const query = new URLSearchParams();
   query.set("chatsessionid", requestId);
   query.set("clientrequestid", requestId);
   query.set("X-SessionId", sessionId);
   query.set("ConversationId", conversationId);
-  query.set("variants", imageFiles ? `${VARIANTS},${IMAGE_FILE_VARIANT}` : VARIANTS);
+  query.set("variants", VARIANTS);
   query.set("source", '"officeweb"');
   query.set("product", "Office");
   query.set("agentHost", "Bizchat.FullScreen");
@@ -1171,7 +1170,7 @@ export function hasNativeFunctionCallEnvelope(value: unknown): boolean {
   return walk(value, 0);
 }
 
-function webSocketURL(account: OAuthTokenSet, sessionId: string, conversationId: string, requestId: string, imageFiles = false): string {
+function webSocketURL(account: OAuthTokenSet, sessionId: string, conversationId: string, requestId: string, _imageFiles = false): string {
   const url = new URL(`${CHAT_HUB}/${encodeURIComponent(account.oid)}@${encodeURIComponent(account.tid)}`);
   url.searchParams.set("chatsessionid", requestId);
   url.searchParams.set("XRoutingParameterSessionKey", requestId);
@@ -1179,7 +1178,7 @@ function webSocketURL(account: OAuthTokenSet, sessionId: string, conversationId:
   url.searchParams.set("X-SessionId", sessionId);
   url.searchParams.set("ConversationId", conversationId);
   url.searchParams.set("access_token", account.accessToken);
-  url.searchParams.set("variants", imageFiles ? `${VARIANTS},${IMAGE_FILE_VARIANT}` : VARIANTS);
+  url.searchParams.set("variants", VARIANTS);
   url.searchParams.set("source", '"officeweb"');
   url.searchParams.set("product", "Office");
   url.searchParams.set("agentHost", "Bizchat.FullScreen");
@@ -1300,16 +1299,15 @@ const UPLOADED_IMAGE_OPTION_SETS = Object.freeze([
 
 function buildChatPayload(request: ChatHubRequest, requestId: string, attachments: ChatHubImageAttachment[], uploadedImages: ReadonlyArray<UploadedConversationImage> = []): string {
   if (uploadedImages.some(image => image.conversationId !== request.conversationId)) throw new Error("IMAGE_UPLOAD_NOT_BOUND");
-  // UploadFile stores the bytes against the conversation. ChatHub still needs
-  // each returned docId as an ImageFile annotation to place those pixels in the
-  // model context; never replay caller metadata or the original data URI here.
+  // This ChatHub route uses the Avalon wire shape: variants on the connection
+  // and ImageFile entries in messageAnnotations. Mixing the non-Avalon
+  // X-variants/queryAnnotations shape leaves only attachment metadata visible.
   const imageFields = uploadedImages.length ? {
     entityAnnotationTypes: ["People", "File", "Event", "Email", "TeamsMessage"],
     messageAnnotations: uploadedImages.map(image => {
       const fileType = image.mimeType === "image/jpeg" ? "jpg" : image.mimeType.slice("image/".length);
       return {
         id: image.docId,
-        ...(image.fileUrl ? { url: image.fileUrl } : {}),
         messageAnnotationMetadata: {
           "@type": "File",
           annotationType: "File",

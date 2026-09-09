@@ -179,33 +179,77 @@ function assistantMessage(content: unknown): Record<string, unknown> {
   return result;
 }
 
+const ANTHROPIC_IMAGE_MEDIA_TYPES = new Set(["image/gif", "image/jpeg", "image/png", "image/webp"]);
+
+function anthropicImagePart(block: Record<string, unknown>): Record<string, unknown> {
+  const source = isRecord(block.source) ? block.source : null;
+  if (!source || source.type !== "base64") invalid("image blocks require a base64 source");
+  const mediaType = typeof source.media_type === "string" ? source.media_type.toLowerCase() : "";
+  if (!ANTHROPIC_IMAGE_MEDIA_TYPES.has(mediaType)) invalid("image source media_type is unsupported");
+  if (typeof source.data !== "string" || !source.data) invalid("image source data must be a non-empty base64 string");
+  return { type: "image_url", image_url: { url: `data:${mediaType};base64,${source.data}`, detail: "high" } };
+}
+
+function toolResultContent(block: Record<string, unknown>): string | Record<string, unknown>[] {
+  if (!Array.isArray(block.content)) return toolResultText(block);
+  const parts: Record<string, unknown>[] = [];
+  let hasImage = false;
+  let hasText = false;
+  for (const item of block.content) {
+    if (!isRecord(item)) invalid("tool_result.content blocks must be objects");
+    if (item.type === "text") {
+      if (typeof item.text !== "string") invalid("tool_result text blocks require a text string");
+      parts.push({ type: "text", text: item.text });
+      hasText ||= item.text.length > 0;
+      continue;
+    }
+    if (item.type === "image") {
+      parts.push(anthropicImagePart(item));
+      hasImage = true;
+      continue;
+    }
+    invalid(`unsupported tool_result content block: ${String(item.type ?? "unknown")}`);
+  }
+  if (!hasImage) return toolResultText(block);
+  if (!hasText) parts.unshift({ type: "text", text: "Image attachment returned by tool." });
+  return parts;
+}
+
 function userMessages(content: unknown): Record<string, unknown>[] {
   if (typeof content === "string") return [{ role: "user", content }];
   if (!Array.isArray(content)) invalid("user message content must be a string or content block array");
   const result: Record<string, unknown>[] = [];
-  let text: string[] = [];
-  const flushText = (): void => {
-    if (text.length === 0) return;
-    result.push({ role: "user", content: text.join("\n") });
-    text = [];
+  let userContent: Record<string, unknown>[] = [];
+  const flushUserContent = (): void => {
+    if (userContent.length === 0) return;
+    const onlyText = userContent.every(part => part.type === "text");
+    result.push({
+      role: "user",
+      content: onlyText ? userContent.map(part => String(part.text ?? "")).join("\n") : userContent,
+    });
+    userContent = [];
   };
   for (const block of content) {
     if (!isRecord(block)) invalid("user content blocks must be objects");
     if (block.type === "text") {
       if (typeof block.text !== "string") invalid("text blocks require a text string");
-      text.push(block.text);
+      userContent.push({ type: "text", text: block.text });
+      continue;
+    }
+    if (block.type === "image") {
+      userContent.push(anthropicImagePart(block));
       continue;
     }
     if (block.type === "tool_result") {
       const callId = typeof block.tool_use_id === "string" ? block.tool_use_id.trim() : "";
       if (!callId) invalid("tool_result blocks require tool_use_id");
-      flushText();
-      result.push({ role: "tool", tool_call_id: callId, content: toolResultText(block) });
+      flushUserContent();
+      result.push({ role: "tool", tool_call_id: callId, content: toolResultContent(block) });
       continue;
     }
     invalid(`unsupported user content block: ${String(block.type ?? "unknown")}`);
   }
-  flushText();
+  flushUserContent();
   if (result.length === 0) result.push({ role: "user", content: "" });
   return result;
 }

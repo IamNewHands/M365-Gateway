@@ -218,6 +218,10 @@ export class TenantState extends DurableObject<Env> {
   }
 
   private async migrate(): Promise<void> {
+    // Secondary indexes are deliberately not created during activation.
+    // Building a missing index writes one entry per existing row and can
+    // exceed the Durable Objects Free per-invocation write allowance,
+    // preventing every RPC from starting. Existing indexes remain intact.
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS admin_sessions (
@@ -343,17 +347,6 @@ export class TenantState extends DurableObject<Env> {
         duration_ms INTEGER NOT NULL,
         code TEXT NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS idx_admin_sessions_expiry ON admin_sessions(expires_at);
-      CREATE INDEX IF NOT EXISTS idx_oauth_states_created ON oauth_states(created_at);
-      CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
-      CREATE INDEX IF NOT EXISTS idx_account_health_cooldown ON account_health(state,cooldown_until);
-      CREATE INDEX IF NOT EXISTS idx_upstream_gate_waiters_fifo ON upstream_gate_waiters(account_id,sequence);
-      CREATE INDEX IF NOT EXISTS idx_upstream_gate_waiters_expiry ON upstream_gate_waiters(expires_at);
-      CREATE INDEX IF NOT EXISTS idx_diagnostic_events_at ON diagnostic_events(at DESC);
-      CREATE INDEX IF NOT EXISTS idx_recorded_request_metrics_at ON recorded_request_metrics(recorded_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_credential_mirror_retry ON credential_mirror_queue(next_attempt_at);
-      CREATE INDEX IF NOT EXISTS idx_credential_delete_retry ON credential_mirror_deletions(next_attempt_at);
-      CREATE INDEX IF NOT EXISTS idx_account_migration_nonces_expiry ON account_migration_nonces(expires_at);
     `);
     // The prune counters are intentionally kept in memory so terminal writes
     // do not perform an extra metadata write.  Rehydrate their phase once at
@@ -381,7 +374,6 @@ export class TenantState extends DurableObject<Env> {
     const apiKeyColumns = new Set(this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(api_keys)").toArray().map((column) => column.name));
     if (!apiKeyColumns.has("last_used_at")) this.ctx.storage.sql.exec("ALTER TABLE api_keys ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0");
     await this.ensureDeploymentAPIKey();
-    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_accounts_sequence ON accounts(sequence_no)");
     let nextSequence = Number.parseInt(this.meta("account_sequence_counter") ?? "0", 10) || 0;
     const maxSequence = this.ctx.storage.sql.exec<{ value: number }>("SELECT COALESCE(MAX(sequence_no),0) AS value FROM accounts").one().value;
     nextSequence = Math.max(nextSequence, maxSequence);

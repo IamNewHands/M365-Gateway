@@ -71,6 +71,23 @@ describe("Codex public command integrity", () => {
     expect(events.at(-1)?.item).toEqual(item);
   });
 
+  it.each([
+    ["exec_command", { cmd: "$newline = :NewLine", shell: "powershell" }],
+    ["exec", { input: "const r = await tools.exec_command({cmd: '$i = :IndexOf($items, $value)'}); text(r);" }],
+    ["write_stdin", { session_id: 7, chars: "$n = [Math]:Max(0, 1)\n" }],
+  ])("rejects known transport-corrupted caller programs for %s", (name, args) => {
+    expect(boundPublicExecFunctionCall({ name, arguments: JSON.stringify(args) })).toBeNull();
+  });
+
+  it("does not confuse paths, URLs or valid PowerShell static members with corruption", () => {
+    const args = {
+      cmd: "$n=[Math]::Max(0,1); Get-Item 'C:\\work:cache'; Invoke-WebRequest 'https://example.invalid/a:b'",
+      shell: "powershell",
+    };
+    const call = boundPublicExecFunctionCall({ name: "exec_command", arguments: JSON.stringify(args) });
+    expect(JSON.parse(call?.arguments ?? "null")).toEqual(args);
+  });
+
   it("preserves functions.exec raw source through custom-tool history, native adaptation and SSE", () => {
     const source = "// @exec: {\"yield_time_ms\": 30000}\r\n" +
       "const args = " + JSON.stringify({ cmd: "[Math]::Max(0,1); Write-Output '$_ 中文 {{json .Config}} Z3DX'", workdir: "C:\\中文路径", max_output_tokens: 50000 }) + ";\r\n" +

@@ -91,6 +91,36 @@ describe("completion evidence operation boundaries", () => {
     expect(summarizeCompletionEvidence(failed).actions.verify?.latest).toBe("failure");
   });
 
+  it("finds a failed command result nested inside a completed Code Mode cell", async () => {
+    const ledger = await parseResponsesToolLedger([
+      { type: "function_call", call_id: "call_nested", name: "exec", arguments: JSON.stringify(codeModeCommand("npm test")) },
+      {
+        type: "function_call_output",
+        call_id: "call_nested",
+        output: JSON.stringify({
+          status: "completed",
+          verified: { chunk_id: "fixture", exit_code: 1, output: "TypeScript failed" },
+        }),
+      },
+    ]);
+
+    expect(ledger.completed[0]).toMatchObject({ failed: true, status: "failure" });
+    expect(summarizeCompletionEvidence(ledger).actions.verify?.latest).toBe("failure");
+  });
+
+  it("does not interpret JSON-like stdout as a nested command status", async () => {
+    const ledger = await parseResponsesToolLedger([
+      { type: "function_call", call_id: "call_stdout", name: "exec", arguments: JSON.stringify(codeModeCommand("npm test")) },
+      {
+        type: "function_call_output",
+        call_id: "call_stdout",
+        output: JSON.stringify({ exit_code: 0, output: '{"fixture":{"exit_code":1}}' }),
+      },
+    ]);
+
+    expect(ledger.completed[0]).toMatchObject({ failed: false, status: "success" });
+  });
+
   it("decodes HTML whitespace before classifying a wrapped inner command failure", async () => {
     const ledger = await parseResponsesToolLedger([
       { type: "function_call", call_id: "call_encoded", name: "exec", arguments: JSON.stringify(codeModeCommand("npm test")) },
