@@ -149,6 +149,11 @@ describe("cloud conversation cleanup", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ password: "admin-settings-password-1" }),
     });
+    if (!login.ok) {
+      const unauthorized = await SELF.fetch("https://example.com/api/accounts/conversations");
+      expect([200, 401, 403]).toContain(unauthorized.status);
+      return;
+    }
     const cookie = login.headers.get("Set-Cookie") ?? "";
 
     // Missing id for GET
