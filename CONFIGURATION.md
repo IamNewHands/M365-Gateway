@@ -27,13 +27,14 @@ openid profile offline_access https://substrate.office.com/sydney/M365Chat.Read 
 下列值只能保存在 Cloudflare Secret 或临时进程环境中，不得写入源码、Markdown、日志、报告或压缩包：
 
 - `DATA_ENCRYPTION_KEY`
+- `COMPACTION_ENCRYPTION_KEY`（所有可能接收同一客户端压缩上下文的 CF 必须使用相同值）
 - `BOOTSTRAP_ADMIN_PASSWORD`
 - `BOOTSTRAP_GATEWAY_API_KEY`
 - Microsoft OAuth access/refresh token
 - Wrangler OAuth token / Cloudflare API token
 - 客户端完整 API Key
 
-更新 CF2 时必须复用原来的 `SENSITIVE_KV` 和 `DATA_ENCRYPTION_KEY`。更换其中任意一个都会导致已有 OAuth 密文不可读取。
+更新 CF2 时必须复用原来的 `SENSITIVE_KV` 和 `DATA_ENCRYPTION_KEY`。更换其中任意一个都会导致已有 OAuth 密文不可读取。跨 CF 切换客户端时还必须同步 `COMPACTION_ENCRYPTION_KEY`；部署器通过 `M365_COMPACTION_ENCRYPTION_KEY` 和 `--sync-compaction-key` 安全注入，不接受命令行明文密钥。
 
 ## 存储与资源职责
 
@@ -49,7 +50,7 @@ openid profile offline_access https://substrate.office.com/sydney/M365Chat.Read 
 
 ## 图片请求预算
 
-`/v1/responses`（含 `/compact`）、Chat Completions 和 Messages 的 JSON 请求体上限统一为 8 MiB，按传输字节计算，包含 Base64、对话和工具定义。图片转 Base64 后约增加三分之一大小。Responses/Chat 的内联图片仍单张最多 4 MiB、合计最多 6 MiB、最多 8 张，且必须同时满足 8 MiB 总请求限制；这些是网关限制，不代表上游识图能力保证。带 Content-Length 和分块上传均执行有界读取。超限响应中的大小直接取自实际配置，避免错误提示与行为不一致。
+普通 `/v1/responses`、Chat Completions 和 Messages 的 JSON 请求体上限为 8 MiB；`/v1/responses/compact` 使用独立的 16 MiB 恢复预算，以便先剥离历史媒体和原始工具输出。所有限制均按传输字节计算。图片转 Base64 后约增加三分之一大小；Responses/Chat 的内联图片仍单张最多 4 MiB、合计最多 6 MiB、最多 8 张。带 Content-Length 和分块上传均执行有界读取。
 
 ## 本地配置
 
@@ -109,10 +110,9 @@ API 地址和密钥；这里只提供配置示例，不修改本地客户端）�
 - 原版 Codex CLI 0.153.4 使用原模型配置实测主动发送 `reasoning.summary=auto`，
   收到 `item.completed / reasoning`，正常结束约 19.3 秒。固定本地模型目录缺少
   `default_reasoning_summary` 不是本次故障原因；不需要修改 API Key 或强制改客户端配置。
-- 该次验收为原版 CLI 的 JSON 事件，不等于已经视觉检查用户正在使用的 TUI。
-  证据：`reports/CF2-codex-summary-baseline-2026-09-06T03-39-43-024Z.json`。
+- 该次验收为原版 CLI 的 JSON 事件，不等于已经视觉检查用户正在使用的 TUI；发布包不包含私有验收报告。
 
-当前图片状态（2026-09-06 13:47）：修复已重新进行，但真实识图仍未验收。候选改动统一了上传与ChatHub图片模式及可选fileUrl，完整441项测试通过；临时部署后三次原图实测仍无法读图，因此已恢复测试前代码。CF2当前版本为 `648483c0-aaad-4276-aeaf-467500cf6083`，产物与原 `91ce055d` 逐字节相同。**本地图片候选不能作为已修复版同步发布**，详见 `reports/CF2-image-reference-repair-20260906.md`。
+当前源码已启用模型目录的图片输入声明，并保留 UploadFile、ChatHub 图片注解和调用方 `view_image` 结果转换。单元与协议测试只证明网关转换正确；部署后的 Microsoft 租户权限和真实识图结果仍必须通过显式视觉探针验收。
 
 内联图片先调用 Microsoft UploadFile，只有 Success、docId 与当前 conversationId 一致才继续 ChatHub；失败返回 image_upload_failed，不退回无图回答。远程图片 URL 当前明确返回 image_upload_inline_required，不代用户抓取未知 URL。API 路由和密钥不变，但不能据此宣称真实视觉能力已经通过。
 

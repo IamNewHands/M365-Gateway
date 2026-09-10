@@ -29,6 +29,10 @@ const models = {
   codex: String(process.env.M365_CODEX_MODEL || defaultModel).trim(),
   opencode: String(process.env.M365_OPENCODE_MODEL || defaultModel).trim(),
   hermes: String(process.env.M365_HERMES_MODEL || defaultModel).trim(),
+  claude: String(process.env.M365_CLAUDE_MODEL || "claude-sonnet-reasoning").trim(),
+  reasonix: String(process.env.M365_REASONIX_MODEL || defaultModel).trim(),
+  pi: String(process.env.M365_PI_MODEL || defaultModel).trim(),
+  zcode: String(process.env.M365_ZCODE_MODEL || defaultModel).trim(),
 };
 const clientKeyEnvName = String(process.env.M365_COMPAT_CLIENT_KEY_ENV || "M365_GATEWAY_API_KEY").trim();
 if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(clientKeyEnvName)) {
@@ -41,12 +45,13 @@ const runWriteOnly = process.env.M365_COMPAT_WRITE_ONLY === "1";
 // for a multi-file repair task and can loop for minutes. Keep that write probe
 // explicitly opt-in; protocol and read/tool-routing checks remain the default.
 const runOpenCodeWriteSmoke = process.env.M365_OPENCODE_WRITE_SMOKE === "1";
-const selectedClients = new Set(String(process.env.M365_COMPAT_CLIENTS || "codex,opencode,hermes")
+const supportedClients = ["codex", "opencode", "hermes", "claude", "reasonix", "pi", "zcode"];
+const selectedClients = new Set(String(process.env.M365_COMPAT_CLIENTS || supportedClients.join(","))
   .split(",")
   .map((value) => value.trim().toLowerCase())
   .filter(Boolean));
-if (selectedClients.size === 0 || [...selectedClients].some((value) => !["codex", "opencode", "hermes"].includes(value))) {
-  throw new Error("M365_COMPAT_CLIENTS must be a comma-separated subset of codex,opencode,hermes");
+if (selectedClients.size === 0 || [...selectedClients].some((value) => !supportedClients.includes(value))) {
+  throw new Error(`M365_COMPAT_CLIENTS must be a comma-separated subset of ${supportedClients.join(",")}`);
 }
 if (runWriteOnly && (selectedClients.size !== 1 || !selectedClients.has("opencode"))) {
   throw new Error("M365_COMPAT_WRITE_ONLY=1 is supported only with M365_COMPAT_CLIENTS=opencode");
@@ -62,13 +67,17 @@ const installedOpenCodeBinary = process.platform === "win32" && localAppData
 const installedHermesBinary = process.platform === "win32" && localAppData
   ? resolve(localAppData, "hermes/hermes-agent/venv/Scripts/hermes.exe")
   : "";
+const installedClaudeBinary = process.platform === "win32" && userProfile
+  ? resolve(userProfile, "codex-cli/node_modules/@anthropic-ai/claude-code/bin/claude.exe")
+  : "";
 const clientBinaries = {
   codex: String(process.env.M365_CODEX_BIN || (existsSync(installedCodexBinary) ? installedCodexBinary : process.platform === "win32" ? "codex.exe" : "codex")).trim(),
   opencode: String(process.env.M365_OPENCODE_BIN || (existsSync(installedOpenCodeBinary) ? installedOpenCodeBinary : "opencode")).trim(),
   hermes: String(process.env.M365_HERMES_BIN || (existsSync(installedHermesBinary) ? installedHermesBinary : process.platform === "win32" ? "hermes.exe" : "hermes")).trim(),
+  claude: String(process.env.M365_CLAUDE_BIN || (existsSync(installedClaudeBinary) ? installedClaudeBinary : process.platform === "win32" ? "claude.exe" : "claude")).trim(),
 };
-const codexProvider = String(process.env.M365_CODEX_PROVIDER || "server6").trim();
-const hermesProvider = String(process.env.M365_HERMES_PROVIDER || "custom:m365-c").trim();
+const codexProvider = String(process.env.M365_CODEX_PROVIDER || "m365_acceptance").trim();
+const hermesProvider = String(process.env.M365_HERMES_PROVIDER || "custom:m365-acceptance").trim();
 const runId = `compat-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
 const startedAt = new Date();
 const checks = [];
@@ -101,7 +110,7 @@ async function stage(client, name, task) {
   }
 }
 
-async function jsonRequest(path, body, timeoutMs = 240_000) {
+async function jsonRequest(path, body, timeoutMs = 240_000, extraHeaders = {}) {
   const started = performance.now();
   const requestPath = baseUrl.endsWith("/v1") && path.startsWith("/v1/") ? path.slice(3) : path;
   const response = await fetch(`${baseUrl}${requestPath}`, {
@@ -110,6 +119,7 @@ async function jsonRequest(path, body, timeoutMs = 240_000) {
       Authorization: authorizationHeader,
       "Content-Type": "application/json",
       "User-Agent": "m365-gateway-client-compat/1.0",
+      ...extraHeaders,
     },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(timeoutMs),
@@ -138,6 +148,32 @@ async function runClientProcess(client, command, args, cwd, timeoutMs = 240_000)
     ? current
     : `${current}${String(chunk)}`.slice(0, outputLimit);
 
+  if (client === "hermes") {
+    const hermesHome = resolve(cwd, ".hermes-acceptance");
+    const providerBaseUrl = baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
+    await mkdir(hermesHome, { recursive: true });
+    await writeFile(resolve(hermesHome, "config.yaml"), [
+      "model:",
+      `  default: ${JSON.stringify(models.hermes)}`,
+      `  provider: ${JSON.stringify(hermesProvider)}`,
+      "  api_mode: chat_completions",
+      "providers:",
+      "  m365-acceptance:",
+      "    name: M365 Gateway acceptance candidate",
+      `    base_url: ${JSON.stringify(providerBaseUrl)}`,
+      `    key_env: ${JSON.stringify(clientKeyEnvName)}`,
+      "    transport: chat_completions",
+      `    default_model: ${JSON.stringify(models.hermes)}`,
+      "    enabled: true",
+      "approvals:",
+      "  mode: false",
+      "plugins:",
+      "  enabled: []",
+      "",
+    ].join("\n"), "utf8");
+    childEnvironment.HERMES_HOME = hermesHome;
+  }
+
   const result = await new Promise((resolveResult, rejectResult) => {
     // The installed OpenCode profile may still point at another Cloudflare
     // deployment.  Keep the user's persistent profile untouched, but make
@@ -156,6 +192,11 @@ async function runClientProcess(client, command, args, cwd, timeoutMs = 240_000)
         },
       });
     }
+    if (client === "claude") {
+      childEnvironment.ANTHROPIC_BASE_URL = baseUrl.endsWith("/v1") ? baseUrl.slice(0, -3) : baseUrl;
+      childEnvironment.ANTHROPIC_API_KEY = authorizationHeader.replace(/^Bearer\s+/u, "");
+      delete childEnvironment.ANTHROPIC_AUTH_TOKEN;
+    }
     const child = spawn(command, args, {
       cwd,
       env: childEnvironment,
@@ -165,6 +206,7 @@ async function runClientProcess(client, command, args, cwd, timeoutMs = 240_000)
     });
     childEnvironment[clientKeyEnvName] = "";
     childEnvironment.OPENCODE_CONFIG_CONTENT = "";
+    childEnvironment.ANTHROPIC_API_KEY = "";
     const timer = setTimeout(() => {
       timedOut = true;
       terminateProcessTree(child);
@@ -348,6 +390,20 @@ function chatText(json) {
   return String(json?.choices?.[0]?.message?.content ?? "");
 }
 
+function anthropicText(json) {
+  return (Array.isArray(json?.content) ? json.content : [])
+    .filter((item) => item?.type === "text")
+    .map((item) => String(item.text || ""))
+    .join("");
+}
+
+function anthropicCall(json, expectedName) {
+  const call = (Array.isArray(json?.content) ? json.content : [])
+    .find((item) => item?.type === "tool_use");
+  if (!call?.id || call.name !== expectedName || !call.input || typeof call.input !== "object") return null;
+  return call;
+}
+
 function responseCall(json, expectedName) {
   const call = (Array.isArray(json?.output) ? json.output : []).find((item) => item?.type === "function_call");
   if (!call || call.name !== expectedName || !call.call_id || typeof call.arguments !== "string") return null;
@@ -473,6 +529,50 @@ const hermesTools = [
 const hermesPatchTool = flatFunction("patch", "Apply a patch to files in the local workspace", {
   mode: { type: "string" }, path: { type: "string" }, old_string: { type: "string" }, new_string: { type: "string" }, replace_all: { type: "boolean" }, patch: { type: "string" }, cross_profile: { type: "boolean" },
 }, ["mode"]);
+const claudeReadTool = {
+  name: "Read",
+  description: "Read a file from the caller's local filesystem",
+  input_schema: {
+    type: "object",
+    properties: { file_path: { type: "string" }, offset: { type: "integer" }, limit: { type: "integer" } },
+    required: ["file_path"],
+    additionalProperties: false,
+  },
+};
+const claudeWebSearchTool = { type: "web_search_20250305", name: "web_search", max_uses: 1 };
+const genericClientCases = {
+  reasonix: {
+    endpoint: "/v1/chat/completions",
+    name: "multi_edit",
+    args: { edits: [{ file_path: "C:\\Compat_Workspace\\app.ts", old_string: "before", new_string: "after" }] },
+    tool: nestedFunction("multi_edit", "Edit multiple files in the caller's local workspace", {
+      edits: { type: "array", items: { type: "object" } },
+    }, ["edits"]),
+  },
+  pi: {
+    endpoint: "/v1/chat/completions",
+    name: "powershell",
+    args: { command: "Get-Location", cwd: "C:\\Compat_Workspace" },
+    tool: nestedFunction("powershell", "Run PowerShell in the caller's local working directory", {
+      command: { type: "string" }, cwd: { type: "string" },
+    }, ["command"]),
+  },
+  zcode: {
+    endpoint: "/v1/responses",
+    name: "terminal_exec",
+    args: { command_text: "pwd" },
+    tool: {
+      name: "terminal_exec",
+      description: "Run a terminal command in the caller's local workspace",
+      inputSchema: {
+        type: "object",
+        properties: { command_text: { type: "string" } },
+        required: ["command_text"],
+        additionalProperties: false,
+      },
+    },
+  },
+};
 
 async function runCodexChecks() {
   const powershellCommand = "Get-ChildItem -LiteralPath 'C:\\Compat_Work\\server=2'; $ConnectTimeout=30; Write-Output $ConnectTimeout";
@@ -607,9 +707,12 @@ async function runHermesChecks() {
   let searchResponse;
   let searchCall;
   for (const [name, expectedArguments, requiredKeys] of cases) {
+    const requestText = name === "search_files"
+      ? `Call search_files exactly once with this arguments object: ${JSON.stringify(expectedArguments)}. After the result, call read_file on the exact discovered path.`
+      : `Call ${name} exactly once with this arguments object: ${JSON.stringify(expectedArguments)}`;
     const response = await jsonRequest("/v1/responses", {
       model: models.hermes,
-      input: `Call ${name} exactly once with this arguments object: ${JSON.stringify(expectedArguments)}`,
+      input: requestText,
       tools: hermesTools,
       tool_choice: { type: "function", name },
     });
@@ -624,15 +727,18 @@ async function runHermesChecks() {
       searchCall = call;
     }
   }
+  const patchArguments = { mode: "replace", path: "/tmp/m365-compat-probe.txt", old_string: "before", new_string: "after", replace_all: false };
   const patchResponse = await jsonRequest("/v1/responses", {
     model: models.hermes,
-    input: "Do not execute a patch; this is a policy probe.",
+    input: `Call patch exactly once with this arguments object: ${JSON.stringify(patchArguments)}. This protocol probe only asks the caller to execute it; do not claim it already ran.`,
     tools: [hermesPatchTool],
     tool_choice: { type: "function", name: "patch" },
   });
-  record("hermes", "responses.patch_is_disabled", patchResponse.status === 400
-    && patchResponse.json?.error?.code === "local_patch_disabled",
-  `status=${patchResponse.status};code=${patchResponse.json?.error?.code || "none"}`);
+  assertClean("Hermes patch", patchResponse);
+  const patchCall = responseCall(patchResponse.json, "patch");
+  record("hermes", "responses.patch", patchResponse.status === 200
+    && compatibleToolArguments(parseArguments(patchCall), patchArguments, ["mode"]),
+  `status=${patchResponse.status};call=${patchCall?.name || "none"}`);
 
   if (!searchResponse?.json?.id || !searchCall) throw new Error("Hermes search_files continuation identity missing");
   const discoveredPath = "/workspace/README.md";
@@ -640,6 +746,7 @@ async function runHermesChecks() {
     model: models.hermes,
     previous_response_id: searchResponse.json.id,
     input: [{ type: "function_call_output", call_id: searchCall.call_id, output: discoveredPath }],
+    instructions: "Call read_file now on the exact path returned by search_files.",
     tools: hermesTools,
     tool_choice: { type: "function", name: "read_file" },
   });
@@ -664,6 +771,67 @@ async function runHermesChecks() {
     `status=${final.status};marker=${responseText(final.json).includes(readMarker)}`);
 }
 
+async function runClaudeChecks() {
+  const path = "C:\\Compat_Workspace\\README.md";
+  const marker = `CLAUDE_READ_RESULT_${runId}`;
+  const first = await jsonRequest("/v1/messages", {
+    model: models.claude,
+    max_tokens: 512,
+    messages: [{ role: "user", content: `Call Read exactly once with file_path ${path}.` }],
+    tools: [claudeReadTool],
+    tool_choice: { type: "tool", name: "Read" },
+  }, 240_000, { "anthropic-version": "2023-06-01" });
+  const call = anthropicCall(first.json, "Read");
+  record("claude", "messages.read", first.status === 200 && call?.input?.file_path === path,
+    `status=${first.status};call=${call?.name || "none"};path=${call?.input?.file_path === path}`);
+  if (!call) throw new Error("Claude Read call identity missing");
+
+  const second = await jsonRequest("/v1/messages", {
+    model: models.claude,
+    max_tokens: 512,
+    messages: [
+      { role: "user", content: `Call Read exactly once with file_path ${path}, then return its marker.` },
+      { role: "assistant", content: first.json.content },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: call.id, content: marker }] },
+    ],
+    tools: [claudeReadTool],
+  }, 240_000, { "anthropic-version": "2023-06-01" });
+  record("claude", "messages.tool_result", second.status === 200 && anthropicText(second.json).includes(marker),
+    `status=${second.status};marker=${anthropicText(second.json).includes(marker)}`);
+
+  const search = await jsonRequest("/v1/messages", {
+    model: models.claude,
+    max_tokens: 512,
+    messages: [{ role: "user", content: "Use web search once to find the official Cloudflare Workers documentation homepage URL. Return only the URL." }],
+    tools: [claudeWebSearchTool],
+  }, 240_000, { "anthropic-version": "2023-06-01" });
+  record("claude", "messages.web_search_schema", search.status === 200 && anthropicText(search.json).trim().length > 0,
+    `status=${search.status};chars=${anthropicText(search.json).length};code=${search.json?.error?.code || "none"}`);
+}
+
+async function runGenericClientChecks(client) {
+  const fixture = genericClientCases[client];
+  if (!fixture) throw new Error(`missing protocol fixture for ${client}`);
+  const nested = fixture.endpoint === "/v1/chat/completions";
+  const body = nested ? {
+    model: models[client],
+    messages: [{ role: "user", content: `Call ${fixture.name} exactly once with this arguments object: ${JSON.stringify(fixture.args)}` }],
+    tools: [fixture.tool],
+    tool_choice: { type: "function", function: { name: fixture.name } },
+  } : {
+    model: models[client],
+    input: `Call ${fixture.name} exactly once with this arguments object: ${JSON.stringify(fixture.args)}`,
+    tools: [fixture.tool],
+    tool_choice: { type: "function", name: fixture.name },
+  };
+  const response = await jsonRequest(fixture.endpoint, body);
+  assertClean(`${client} ${fixture.name}`, response);
+  const call = nested ? chatCall(response.json, fixture.name) : responseCall(response.json, fixture.name);
+  record(client, `protocol.${fixture.name}`, response.status === 200
+    && compatibleToolArguments(parseArguments(call), fixture.args, Object.keys(fixture.args)),
+  `status=${response.status};call=${nested ? call?.function?.name || "none" : call?.name || "none"}`);
+}
+
 async function runCodexClientSmoke() {
   await withTemporaryFixture("m365-codex", async (fixturePath) => {
     const marker = `CODEX_CLIENT_MARKER_${runId}`;
@@ -681,6 +849,15 @@ async function runCodexClientSmoke() {
       "Then return the file's exact first line and the CONNECT value. Do not guess either value.",
       powershellCommand,
     ].join("\n");
+    const providerBaseUrl = baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
+    const codexProviderOverrides = [
+      "-c", `model_provider=${JSON.stringify(codexProvider)}`,
+      "-c", `model_providers.${codexProvider}.name="M365 Gateway acceptance candidate"`,
+      "-c", `model_providers.${codexProvider}.base_url=${JSON.stringify(providerBaseUrl)}`,
+      "-c", `model_providers.${codexProvider}.env_key=${JSON.stringify(clientKeyEnvName)}`,
+      "-c", `model_providers.${codexProvider}.wire_api="responses"`,
+      "-c", `model_providers.${codexProvider}.requires_openai_auth=false`,
+    ];
     const result = await runClientProcess("codex", clientBinaries.codex, [
       "exec",
       "--json",
@@ -692,8 +869,7 @@ async function runCodexClientSmoke() {
       fixturePath,
       "-m",
       models.codex,
-      "-c",
-      `model_provider=${JSON.stringify(codexProvider)}`,
+      ...codexProviderOverrides,
       prompt,
     ], fixturePath);
     const output = `${result.stdout}\n${result.stderr}`;
@@ -716,8 +892,7 @@ async function runCodexClientSmoke() {
       fixturePath,
       "-m",
       models.codex,
-      "-c",
-      `model_provider=${JSON.stringify(codexProvider)}`,
+      ...codexProviderOverrides,
       "Read SPEC.md. Run node verify.mjs once to observe the existing failure. Local patch programs are forbidden: do not call, generate, or mention apply_patch, patch, diff, or edit-style patch tools. Repair only index.html, style.css and app.js with direct one-file writes (use exec_command with a short native Node fs.writeFileSync or PowerShell Set-Content), read each written file back, and rerun node verify.mjs until it exits 0. Do not edit SPEC.md or verify.mjs, do not use network access, and finish by reporting the exact marker only after the verifier exits 0.",
     ], fixturePath, 480_000);
     const webpageOutput = `${webpageResult.stdout}\n${webpageResult.stderr}`;
@@ -834,16 +1009,56 @@ async function runHermesClientSmoke() {
   });
 }
 
+async function runClaudeClientSmoke() {
+  await withTemporaryFixture("m365-claude", async (fixturePath) => {
+    const marker = `CLAUDE_CLIENT_MARKER_${runId}`;
+    await writeFile(resolve(fixturePath, "README.md"), `# Claude compatibility fixture\n\n${marker}\n`, "utf8");
+    const result = await runClientProcess("claude", clientBinaries.claude, [
+      "-p",
+      "Use Read exactly once on README.md in the current workspace, then return its marker exactly. Do not use Agent, Bash, or any other tool and do not guess the marker.",
+      "--tools",
+      "Read",
+      "--disallowed-tools",
+      "Agent",
+      "--dangerously-skip-permissions",
+      "--no-session-persistence",
+      "--output-format",
+      "json",
+      "--model",
+      models.claude,
+    ], fixturePath);
+    const output = `${result.stdout}\n${result.stderr}`;
+    const leaks = leakReasons(output);
+    record("claude", "client.read", result.code === 0 && !result.timedOut
+      && output.includes(marker) && leaks.length === 0,
+    `exit=${result.code ?? "none"};timeout=${result.timedOut};marker=${output.includes(marker)};leaks=${leaks.length}${result.code === 0 && output.includes(marker) ? "" : `;${diagnosticTail(result)}`}`);
+  });
+}
+
+function recordUnavailableClientSmoke(client) {
+  record(client, "client_suite", true,
+    "skipped=true;reason=client_binary_not_installed;protocol_schema_was_verified",
+    { skipped: true });
+}
+
 try {
   if (!runWriteOnly) {
     if (selectedClients.has("codex")) await stage("codex", "suite", runCodexChecks);
     if (selectedClients.has("opencode")) await stage("opencode", "suite", runOpenCodeChecks);
     if (selectedClients.has("hermes")) await stage("hermes", "suite", runHermesChecks);
+    if (selectedClients.has("claude")) await stage("claude", "suite", runClaudeChecks);
+    if (selectedClients.has("reasonix")) await stage("reasonix", "suite", () => runGenericClientChecks("reasonix"));
+    if (selectedClients.has("pi")) await stage("pi", "suite", () => runGenericClientChecks("pi"));
+    if (selectedClients.has("zcode")) await stage("zcode", "suite", () => runGenericClientChecks("zcode"));
   }
   if (runClientSmoke) {
     if (selectedClients.has("codex")) await stage("codex", "client_suite", runCodexClientSmoke);
     if (selectedClients.has("opencode")) await stage("opencode", "client_suite", runOpenCodeClientSmoke);
     if (selectedClients.has("hermes")) await stage("hermes", "client_suite", runHermesClientSmoke);
+    if (selectedClients.has("claude")) await stage("claude", "client_suite", runClaudeClientSmoke);
+    for (const client of ["reasonix", "pi", "zcode"]) {
+      if (selectedClients.has(client)) recordUnavailableClientSmoke(client);
+    }
   }
 
   const ordered = timings.map((item) => item.milliseconds).sort((a, b) => a - b);

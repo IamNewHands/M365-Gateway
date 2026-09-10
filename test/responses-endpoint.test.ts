@@ -444,7 +444,7 @@ describe("Responses endpoint regressions", () => {
     expect(response.status).toBe(200);
     const body = await response.json<{ output: Array<{ type: string; encrypted_content?: string }> }>();
     const capsule = await decryptJSON<{ checkpoint: { toolLedgerSnapshot: string; portableProtocolTail: string } }>(
-      body.output.find((item) => item.type === "compaction")!.encrypted_content!, env.DATA_ENCRYPTION_KEY,
+      body.output.find((item) => item.type === "compaction")!.encrypted_content!, env.COMPACTION_ENCRYPTION_KEY!,
     );
     expect(capsule.checkpoint.toolLedgerSnapshot).toContain("view_image");
     expect(capsule.checkpoint.portableProtocolTail).not.toContain(imageURL);
@@ -1749,34 +1749,34 @@ describe("Responses endpoint regressions", () => {
     expect(resumedPrompt?.match(new RegExp(currentTurn, "g"))).toHaveLength(1);
   }, 15_000);
 
-  it("supersedes a concurrent same-session request without exposing an active-request error", async () => {
+  it("keeps the active same-session request running and rejects a concurrent retry", async () => {
     const auth = await credential();
     let firstStartedResolve!: () => void;
     const firstStarted = new Promise<void>((resolve) => { firstStartedResolve = resolve; });
+    let firstSocket!: WebSocket;
     installChatHub(({ index, socket }) => {
       if (index === 0) {
+        firstSocket = socket;
         firstStartedResolve();
         return;
       }
-      complete(socket, "replacement request completed");
+      throw new Error("a concurrent retry must not start another Microsoft invocation");
     });
     const shared = `concurrent-${crypto.randomUUID()}`;
     const firstPending = postResponse(auth.apiKey, {
       prompt_cache_key: shared,
       input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "first request" }] }],
-    });
+    }).then(async (response) => ({ status: response.status, body: await response.text() }));
     await firstStarted;
-    const replacementPending = postResponse(auth.apiKey, {
+    const replacement = await postResponse(auth.apiKey, {
       prompt_cache_key: shared,
       input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "replacement request" }] }],
     });
-    const [first, replacement] = await Promise.all([firstPending, replacementPending]);
-    const replacementBody = await replacement.text();
-    expect(replacement.status).toBe(200);
-    expect(replacementBody).toContain("replacement request completed");
-    expect(replacementBody).not.toContain("this conversation already has an active request");
-    expect(first.headers.get("X-M365-Error-Code")).not.toBe("conversation_busy");
-    expect(first.status).not.toBe(409);
-    expect(replacement.status).not.toBe(409);
+    expect(replacement.status).toBe(409);
+    expect(replacement.headers.get("X-M365-Error-Code")).toBe("conversation_busy");
+    complete(firstSocket, "first request completed");
+    const first = await firstPending;
+    expect(first.status).toBe(200);
+    expect(first.body).toContain("first request completed");
   }, 15_000);
 });

@@ -31,9 +31,10 @@ import {
   type ToolLedgerSnapshotEntry,
 } from "./tool-ledger";
 import { validateToolArguments } from "./tool-schema";
-import { appendPublicReasoning, publicReasoningEvents, publicReasoningWithDefault } from "./public-reasoning";
+import { functionToolDefinition, type FunctionToolDefinition } from "./function-tools";
+import { appendPublicReasoning, publicReasoningEvents, publicReasoningWithDefault, requestsPublicReasoning } from "./public-reasoning";
 import { createUpstreamGateLifecycle, type UpstreamGateLifecycle } from "./upstream-lifecycle";
-import { MAX_AI_REQUEST_BYTES, MAX_RESPONSES_REQUEST_BYTES, readJSONLimited } from "./request-body";
+import { MAX_AI_REQUEST_BYTES, MAX_COMPACTION_REQUEST_BYTES, MAX_RESPONSES_REQUEST_BYTES, readJSONLimited } from "./request-body";
 import type { RequestMetricTracker } from "./request-metrics";
 import {
   MultimodalInputError,
@@ -2405,23 +2406,15 @@ export async function acquireConversationLease(
       const remaining = busyDeadline - Date.now();
       if (remaining <= 0) {
         if (Date.now() >= deadlineAt) throw new Error("CONVERSATION_BUSY");
-        const displaced = await session.supersedeActive();
-        if (!displaced) {
-          await abortableDelay(Math.min(25, Math.max(1, deadlineAt - Date.now())), signal);
-          continue;
-        }
-        if (displaced.upstream) {
-          const state = env.TENANTS.getByName(env.TENANT_NAME || "default");
-          await retireSupersededUpstream(
-            displaced.upstream,
-            async (accountId, runId) => {
-              const runner = env.CHATS.getByName(`${CHAT_HUB_RUNNER_PREFIX}${accountId}`);
-              return runner.cancelChatHub(runId);
-            },
-            (accountId, gateLeaseId) => state.releaseUpstream(accountId, gateLeaseId),
-          );
-        }
-        return displaced.lease;
+        // The lease protects the whole logical turn, including validation and
+        // terminal persistence after Microsoft has stopped producing bytes.
+        // Replacing it in that post-upstream window makes both requests race
+        // the same CAS commit and surfaces a false conversation_lease_conflict.
+        // Let the owner finish; retrying SDKs receive a bounded 409 instead of
+        // cancelling or corrupting the request they are waiting for.
+        const finalAttempt = await session.tryAcquire();
+        if (finalAttempt.ok) return finalAttempt.lease;
+        throw new Error(finalAttempt.code === "CONVERSATION_BUSY" ? "CONVERSATION_BUSY" : finalAttempt.code);
       }
       const retryDelay = conversationLeaseRetryDelay(busyRetries, remaining);
       if (retryDelay <= 0) continue;
@@ -3185,13 +3178,6 @@ type CallerLocalCapability =
   | "visual_read"
   | "computer_control";
 
-interface FunctionToolDefinition {
-  raw: unknown;
-  name: string;
-  description: string;
-  parameters: unknown;
-}
-
 interface CallerLocalToolCandidate extends FunctionToolDefinition {
   capabilities: CallerLocalCapability[];
 }
@@ -3200,29 +3186,6 @@ interface CallerLocalRecoveryRoute {
   candidates: CallerLocalToolCandidate[];
   tools: unknown[];
   choice: "required" | { type: "function"; name: string };
-}
-
-function functionToolDefinition(raw: unknown): FunctionToolDefinition | null {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const tool = raw as {
-    type?: unknown;
-    function?: unknown;
-    name?: unknown;
-    description?: unknown;
-    parameters?: unknown;
-  };
-  if (tool.type !== undefined && tool.type !== "function") return null;
-  const definition = tool.function && typeof tool.function === "object" && !Array.isArray(tool.function)
-    ? tool.function as { name?: unknown; description?: unknown; parameters?: unknown }
-    : tool;
-  const name = typeof definition.name === "string" ? definition.name.trim() : "";
-  if (!name) return null;
-  return {
-    raw,
-    name,
-    description: typeof definition.description === "string" ? definition.description : "",
-    parameters: definition.parameters,
-  };
 }
 
 function normalizedToolIdentifier(value: string): string {
@@ -3259,7 +3222,10 @@ function callerLocalToolCandidate(raw: unknown): CallerLocalToolCandidate | null
   const commandShape = hasAny(properties, ["cmd", "command", "commands", "code", "script"]);
   const sessionShape = hasAny(properties, ["session_id", "sessionid", "process_id", "processid", "pid"]);
   const processActionShape = sessionShape && hasAny(properties, ["action", "chars", "input", "data", "signal"]);
-  const pathShape = hasAny(properties, ["path", "file_path", "filepath", "directory", "folder", "root", "workdir", "cwd"]);
+  const pathShape = hasAny(properties, [
+    "path", "file_path", "filepath", "directory", "folder", "root", "workdir", "cwd",
+    "source", "source_path", "destination", "destination_path",
+  ]);
   const patternShape = hasAny(properties, ["pattern", "glob", "query", "include", "regex"]);
   const contentShape = hasAny(properties, ["content", "contents", "text", "data"]);
   const patchShape = hasAny(properties, LOCAL_PATCH_PROPERTY_NAMES);
@@ -3290,15 +3256,17 @@ function callerLocalToolCandidate(raw: unknown): CallerLocalToolCandidate | null
     || (pathShape && localDescription && fileDescription && readDescription)) {
     capabilities.add("filesystem_read");
   }
-  if (["glob", "grep", "search_files"].includes(name) && (patternShape || pathShape || (localDescription && fileDescription))
+  if (["find", "glob", "grep", "list_directory", "ls", "search_files"].includes(name)
+    && (patternShape || pathShape || (localDescription && fileDescription))
     || (patternShape && pathShape && fileDescription && searchDescription)) {
     capabilities.add("filesystem_search");
   }
-  if (["write", "write_file"].includes(name) && (pathShape || contentShape || (localDescription && fileDescription))
+  if (["move_file", "write", "write_file"].includes(name) && (pathShape || contentShape || (localDescription && fileDescription))
     || (pathShape && contentShape && fileDescription && writeDescription)) {
     capabilities.add("filesystem_write");
   }
-  if (["patch", "apply_patch"].includes(name) && (patchShape || patchDescription || properties.size === 0)
+  if (["edit", "edit_file", "multi_edit", "patch", "apply_patch"].includes(name)
+    && (patchShape || patchDescription || properties.size === 0)
     || (patchShape && patchDescription)) {
     capabilities.add("filesystem_patch");
   }
@@ -3791,7 +3759,6 @@ async function resolveFunctionCall(
   metrics?: RequestMetricTracker,
   taskAnchors: ReadonlyArray<TaskAnchor> = [],
   retryNarrowedNoTool = false,
-  preserveFullToolSetOnRetry = false,
 ): Promise<FunctionCallResolution> {
   const logicalDeadline = deadlineAt ?? logicalRequestDeadlineAt();
   if (ledger.roundCount >= ledger.maxToolRounds) {
@@ -5116,7 +5083,6 @@ ${callerLocalIntentPrompt}`;
         metrics,
         lease.taskAnchors,
         false,
-        true,
       );
       if (repaired.kind === "call") return { kind: "upstream", call: repaired.call, result };
       if (repaired.kind === "invalid") throw cause;
@@ -5409,7 +5375,6 @@ ${callerLocalIntentPrompt}`;
         metrics,
         lease.taskAnchors,
         !terminalAnswerUsable || failedActionNeedsRecovery,
-        failedActionNeedsRecovery,
       );
       if (next.kind === "call") return { kind: "upstream", call: next.call, result: auditResult };
       if (pendingAssistantAction) {
@@ -6223,7 +6188,6 @@ function responseCustomToolInput(call: FunctionCall): string | null {
 }
 
 function responseOutput(
-  responseId: string,
   result: ChatHubResult,
   call: FunctionCall | null,
   tools?: unknown[],
@@ -6268,8 +6232,30 @@ function responseObject(responseId: string, model: string, output: unknown[], st
   };
 }
 
-const COMPACT_RETAINED_TEXT_CHARACTERS = 256_000;
-const COMPACT_RETAINED_ASSISTANT_CHARACTERS = 32_000;
+// The compacted output is sent back through the client's model context together
+// with the encrypted checkpoint and caller tool declaration. Bound public text
+// by estimated tokens rather than UTF-16 characters so CJK/code-heavy sessions
+// cannot immediately exceed the advertised 90k auto-compaction threshold.
+const COMPACT_RETAINED_TEXT_TOKENS = 24_000;
+const COMPACT_RETAINED_ASSISTANT_TOKENS = 6_000;
+
+function compactTextSuffix(value: string, maximumTokens: number): string {
+  if (maximumTokens <= 0) return "";
+  if (estimatePromptTokens(value) <= maximumTokens) return value;
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    const start = value.length - middle;
+    const candidate = value.slice(start);
+    if (estimatePromptTokens(candidate) <= maximumTokens) low = middle;
+    else high = middle - 1;
+  }
+  let start = value.length - low;
+  // Never return a suffix beginning in the middle of a surrogate pair.
+  if (start > 0 && /[\uDC00-\uDFFF]/u.test(value[start] ?? "")) start += 1;
+  return value.slice(start);
+}
 /** Preserve the latest caller-runtime declaration across compaction. Codex
  * Responses Lite carries functions.exec/write_stdin in `additional_tools`
  * rather than the top-level tools array; dropping this item makes the next
@@ -6304,8 +6290,10 @@ function compactRetainedAdditionalTools(input: unknown): Record<string, unknown>
 export function compactRetainedMessages(input: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(input)) return [];
   const retained: Array<Record<string, unknown>> = [];
-  let remaining = COMPACT_RETAINED_TEXT_CHARACTERS;
-  let assistantRemaining = COMPACT_RETAINED_ASSISTANT_CHARACTERS;
+  const additionalTools = compactRetainedAdditionalTools(input);
+  const toolTokens = additionalTools ? estimatePromptTokens(JSON.stringify(additionalTools)) : 0;
+  let remaining = Math.max(0, COMPACT_RETAINED_TEXT_TOKENS - toolTokens);
+  let assistantRemaining = Math.min(COMPACT_RETAINED_ASSISTANT_TOKENS, remaining);
   for (let index = input.length - 1; index >= 0 && remaining > 0; index -= 1) {
     const raw = input[index];
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
@@ -6328,9 +6316,10 @@ export function compactRetainedMessages(input: unknown): Array<Record<string, un
     if (!text) continue;
     const roleRemaining = role === "assistant" ? Math.min(remaining, assistantRemaining) : remaining;
     if (roleRemaining <= 0) continue;
-    const bounded = text.length <= roleRemaining ? text : text.slice(text.length - roleRemaining);
-    remaining -= bounded.length;
-    if (role === "assistant") assistantRemaining -= bounded.length;
+    const bounded = compactTextSuffix(text, roleRemaining);
+    const boundedTokens = estimatePromptTokens(bounded);
+    remaining -= boundedTokens;
+    if (role === "assistant") assistantRemaining -= boundedTokens;
     retained.push({
       id: typeof item.id === "string" && item.id ? item.id : `msg_${crypto.randomUUID().replaceAll("-", "")}`,
       type: "message",
@@ -6339,7 +6328,6 @@ export function compactRetainedMessages(input: unknown): Array<Record<string, un
       content: [{ type: role === "assistant" ? "output_text" : "input_text", text: bounded }],
     });
   }
-  const additionalTools = compactRetainedAdditionalTools(input);
   return [...(additionalTools ? [additionalTools] : []), ...retained.reverse()];
 }
 
@@ -6383,6 +6371,13 @@ export function compactPortableTaskTail(input: unknown): string {
       `[ASSISTANT]\n${escapePromptProtocolText(text)}`,
     );
     pendingUser = "";
+  }
+  if (pendingUser) {
+    tail = appendPortableProtocolTurn(
+      tail,
+      pendingUser,
+      "[ASSISTANT]\n[REQUEST PENDING AT COMPACTION; NO RESPONSE OR TOOL ACTION WAS COMPLETED]",
+    );
   }
   return boundedPortableProtocolSuffix(tail, 64 * 1_024);
 }
@@ -6559,7 +6554,7 @@ export function hydrateLeaseFromCompaction(
 }
 
 async function responsesCompact(request: Request, env: Env): Promise<Response> {
-  const parsed = await body<ResponsesBody>(request, MAX_RESPONSES_REQUEST_BYTES);
+  const parsed = await body<ResponsesBody>(request, MAX_COMPACTION_REQUEST_BYTES);
   if (!parsed || typeof parsed !== "object") throw new Error("INVALID_REQUEST");
   compactOversizedResponsesToolOutputs(parsed.input);
   const model = canonicalModel(parsed.model);
@@ -7083,7 +7078,7 @@ function responsesStream(
           markCheckpointMetric(metrics, result);
           const safeCall = publicFunctionCall(call);
           const businessOutput = safeCall
-            ? responseOutput(responseId, result, safeCall, tools)
+            ? responseOutput(result, safeCall, tools)
             : [{ id: messageId, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: assistantVisibleText(result), annotations: [] }] }];
           const output = appendPublicReasoning(businessOutput, result.publicReasoningSummary, publicSummaryRequested);
           const item = output[0] as Record<string, unknown>;
@@ -7399,7 +7394,7 @@ async function responsesCore(
     const turn = await resolveAssistantTurn(env, session, lease, account, prompt, tone, parsed.tools, parsed.tool_choice, attachments, ledger, ledger, undefined, signal, undefined, deadlineAt, metrics, accountRouteRecoveryPrompt, outputs.length > 0);
     const { call, result } = turn;
     markCheckpointMetric(metrics, result);
-    const output = appendPublicReasoning(responseOutput(responseId, result, call, parsed.tools), result.publicReasoningSummary, publicReasoningWithDefault(parsed.reasoning));
+    const output = appendPublicReasoning(responseOutput(result, call, parsed.tools), result.publicReasoningSummary, publicReasoningWithDefault(parsed.reasoning));
     if (signal.aborted) throw new Error("REQUEST_ABORTED");
     const finalTail = appendPortableProtocolTurn(portableBaseTail, currentTurnPrompt, portableAssistantResult(result, call));
     await completeFinalTurn(session, lease, result, finalTail, ledger);
@@ -7698,6 +7693,7 @@ export async function openAIRequest(
     if (code === "SESSION_ACCOUNT_ISOLATED" || code === "SESSION_ACCOUNT_MISSING" || code === "ACCOUNT_MISSING") return apiError(503, "session_account_unavailable", "the account bound to this conversation is unavailable");
     if (code === "CONVERSATION_BUSY") return apiError(409, "conversation_busy", "this conversation already has an active request", { "Retry-After": "1" });
     if (code === "CHAT_RUN_ALREADY_ACTIVE") return apiError(409, "conversation_busy", "this conversation already has an active request", { "Retry-After": "1" });
+    if (code === "REQUEST_ABORTED") return apiError(499, "request_cancelled", "request was cancelled");
     if (code === "ACCOUNT_QUEUE_TIMEOUT") return apiError(429, "account_busy", "the Microsoft 365 account is busy; retry later");
     if (code === "CHAT_THROTTLED_QUOTA_EXHAUSTED") return apiError(429, "upstream_throttled", "the selected Microsoft 365 account has exhausted its current allowance");
     if (code === "CHAT_UPSTREAM_RATE_LIMITED") return apiError(429, "upstream_rate_limit", "Microsoft ChatHub is temporarily rate-limited; retry later");

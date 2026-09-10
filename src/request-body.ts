@@ -18,6 +18,12 @@ export const MAX_AI_REQUEST_BYTES = 8 * 1024 * 1024;
 // outputs are still compacted after parsing. Do not remove the streaming cap.
 export const MAX_RESPONSES_REQUEST_BYTES = MAX_AI_REQUEST_BYTES;
 
+// Compaction intentionally discards binary media and raw tool output after
+// parsing. Give that recovery endpoint a larger but still memory-bounded wire
+// allowance so a session slightly above the normal inference limit can recover
+// instead of becoming permanently uncompactionable.
+export const MAX_COMPACTION_REQUEST_BYTES = 16 * 1024 * 1024;
+
 function declaredLength(request: Request): number | null {
   const raw = request.headers.get("Content-Length")?.trim();
   if (!raw) return null;

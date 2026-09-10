@@ -25,7 +25,7 @@ import { RequestMetricTracker } from "../src/request-metrics";
 import { validateToolArguments } from "../src/tool-schema";
 import { DEFAULT_MAX_TOOL_ROUNDS, completedEvidenceContext, completedToolSnapshots, guardProposedToolCalls, parseChatCompletionEvidenceLedger, parseChatToolLedger, parseResponsesToolLedger } from "../src/tool-ledger";
 import { createUpstreamGateLifecycle, UPSTREAM_CANCEL_IDLE_TIMEOUT_MS } from "../src/upstream-lifecycle";
-import { canonicalModel, CODEX_AUTO_COMPACT_TOKEN_LIMIT, codexModelCatalog, modelCatalog, modelTone } from "../src/models";
+import { canonicalModel, CODEX_AUTO_COMPACT_TOKEN_LIMIT, codexModelCatalog, estimatePromptTokens, modelCatalog, modelTone } from "../src/models";
 import { boundedPortableProtocolSuffix } from "../src/chat-session";
 import { normalizeMultimodalContent, MultimodalInputError } from "../src/multimodal";
 
@@ -74,7 +74,7 @@ describe("model catalog and ChatHub tones", () => {
     expect(modelCatalog().find((model) => model.id === "gpt-6-astra")).toMatchObject({
       owned_by: "microsoft-365",
       x_m365_availability: "tenant_dependent",
-      capabilities: { chat_completions: true, responses: true, vision: false, image_generation: false },
+      capabilities: { chat_completions: true, responses: true, vision: true, image_generation: false },
       x_m365_reasoning: { summaries: false },
     });
   });
@@ -112,7 +112,8 @@ describe("model catalog and ChatHub tones", () => {
       default_reasoning_level: "low",
       use_responses_lite: false,
       tool_mode: "direct",
-      input_modalities: ["text"],
+      input_modalities: ["text", "image"],
+      supports_image_detail_original: true,
     });
     expect(sol).not.toHaveProperty("multi_agent_version");
     expect(String(sol?.base_instructions)).toContain("live schemas");
@@ -522,6 +523,15 @@ describe("Responses compaction boundary", () => {
     expect(rendered).toContain('"name":"exec"');
     expect(rendered).toContain("tools.write_stdin");
     expect(retained[1]).toMatchObject({ type: "message", role: "user" });
+  });
+
+  it("bounds compacted CJK text by tokens instead of characters", () => {
+    const retained = compactRetainedMessages([
+      { type: "message", role: "user", content: [{ type: "input_text", text: "中".repeat(100_000) }] },
+    ]);
+    const text = String(((retained.at(-1)?.content as Array<{ text?: string }> | undefined)?.[0]?.text) ?? "");
+    expect(estimatePromptTokens(text)).toBeLessThanOrEqual(24_000);
+    expect(text.length).toBeLessThan(100_000);
   });
 });
 
@@ -1253,6 +1263,36 @@ describe("Fable caller-local refusal recovery", () => {
     }
   });
 
+  it("recognizes OpenHarness, Reasonix, and Pi local command families", () => {
+    const nested = (name: string, description: string, properties: Record<string, unknown>) => ({
+      type: "function",
+      function: {
+        name,
+        description,
+        parameters: { type: "object", properties, additionalProperties: false },
+      },
+    });
+    const localTools = [
+      nested("Bash", "Run a local shell command", { command: { type: "string" } }),
+      nested("Read", "Read a local file", { file_path: { type: "string" } }),
+      nested("Glob", "Find files in the local workspace", { pattern: { type: "string" }, path: { type: "string" } }),
+      nested("Edit", "Edit a local file", { file_path: { type: "string" }, old_string: { type: "string" }, new_string: { type: "string" } }),
+      nested("ls", "List a local directory", { path: { type: "string" } }),
+      nested("move_file", "Move a local file", { source_path: { type: "string" }, destination_path: { type: "string" } }),
+      nested("multi_edit", "Edit multiple local files", { edits: { type: "array" }, old_string: { type: "string" } }),
+      nested("find", "Find files in the working directory", { pattern: { type: "string" }, path: { type: "string" } }),
+      nested("powershell", "Run PowerShell in the local working directory", { command: { type: "string" }, cwd: { type: "string" } }),
+    ];
+    for (const tool of localTools) {
+      const name = tool.function.name;
+      expect(candidate(
+        "Inspect C:\\work\\gateway and continue the task.",
+        "I cannot access the caller's local tools.",
+        { tools: [tool] },
+      ), name).toBe(true);
+    }
+  });
+
   it("narrows a second local repair from search evidence to the caller read tool", async () => {
     const openCodeLedger = await parseChatToolLedger([
       { role: "assistant", tool_calls: [{ id: "glob-1", type: "function", function: { name: "glob", arguments: '{"pattern":"**/*"}' } }] },
@@ -1523,6 +1563,61 @@ describe("lossless client-tool transport", () => {
     expect(invocation.arguments[0].toolChoice.name).toBe(clientToolWireName(selected));
   });
 
+  it("keeps Hermes' complete tool set in the compact routing contract without duplicating plugins", () => {
+    const names = [
+      "browser_exec", "clarify", "computer_use", "delegate_task", "execute_code",
+      "memory", "patch", "process", "read_file", "search_files", "session_search",
+      "skill_manage", "skill_view", "skills_list", "terminal", "text_to_speech",
+      "todo", "vision_analyze", "write_file",
+    ];
+    const tools = names.map((name, index) => ({
+      type: "function",
+      function: {
+        name,
+        description: `Hermes caller tool ${index}. ${"Detailed runtime behavior. ".repeat(34)}`,
+        parameters: {
+          type: "object",
+          properties: {
+            value: {
+              type: "string",
+              description: `Hermes argument ${index}. ${"Preserve the caller value exactly. ".repeat(34)}`,
+            },
+          },
+          required: ["value"],
+          additionalProperties: false,
+        },
+      },
+    }));
+    const rawManifestCharacters = JSON.stringify(tools).length;
+    expect(rawManifestCharacters).toBeLessThan(64_000);
+    expect(rawManifestCharacters).toBeGreaterThan(30_000);
+
+    const payload = chatPayload({
+      text: "Inspect the workspace with the appropriate Hermes tool.",
+      conversationId: "conversation-hermes-toolset",
+      sessionId: "session-hermes-toolset",
+      started: true,
+      tone: "Creative",
+      tools,
+      toolChoice: "auto",
+    }, "request-hermes-toolset");
+    const invocation = JSON.parse(payload.split("\u001e")[0]) as {
+      arguments: Array<{ message: { text: string }; plugins: unknown[]; toolChoice: unknown }>;
+    };
+    const modelFacing = invocation.arguments[0];
+    expect(modelFacing.plugins).toEqual([]);
+    expect(modelFacing.toolChoice).toBe("none");
+    expect(modelFacing.message.text.length).toBeLessThan(12_000);
+    for (const name of names) expect(modelFacing.message.text).toContain(clientToolWireName(name));
+
+    const terminalAlias = clientToolWireName("terminal");
+    expect(parseFunctionCall(JSON.stringify({
+      decision: "tool_call",
+      name: terminalAlias,
+      arguments: { value: "Get-Location" },
+    }), tools)?.name).toBe("terminal");
+  });
+
   it("preserves nested Code Mode tool semantics without exposing plugin identities", () => {
     const codeModeExec = {
       type: "function",
@@ -1635,6 +1730,41 @@ describe("lossless client-tool transport", () => {
       name: alias,
       arguments: JSON.stringify({ workdir: "/workspace" }),
     }, [terminalTool])).toBeNull();
+  });
+
+  it("preserves tool schemas used by every supported coding client", () => {
+    const schema = {
+      type: "object",
+      properties: { command_text: { type: "string" } },
+      required: ["command_text"],
+      additionalProperties: false,
+    };
+    const clients = [
+      { client: "OpenHarness", name: "Bash", tool: { type: "function", function: { name: "Bash", description: "Run a command", parameters: schema } } },
+      { client: "Reasonix", name: "multi_edit", tool: { type: "function", function: { name: "multi_edit", description: "Edit several files", parameters: schema } } },
+      { client: "Pi Agent", name: "powershell", tool: { type: "function", function: { name: "powershell", description: "Run PowerShell", parameters: schema } } },
+      { client: "Codex", name: "exec", tool: { type: "function", name: "exec", description: "Run Code Mode", parameters: schema } },
+      { client: "ZCode", name: "terminal_exec", tool: { name: "terminal_exec", description: "Run a terminal command", inputSchema: schema } },
+      { client: "OpenCode", name: "apply_patch", tool: { type: "function", function: { name: "apply_patch", description: "Apply a patch", parameters: schema } } },
+      { client: "Claude Code", name: "Read", tool: { name: "Read", description: "Read a file", input_schema: schema } },
+      { client: "Hermes", name: "terminal", tool: { type: "function", name: "terminal", description: "Run a command", parameters: schema } },
+    ];
+
+    for (const fixture of clients) {
+      const plugins = clientPlugins([fixture.tool]);
+      expect(plugins, fixture.client).toEqual([{
+        Id: clientToolWireName(fixture.name),
+        Source: "Client",
+        Description: expect.any(String),
+        Parameters: schema,
+      }]);
+      expect(validateToolArguments(
+        fixture.name,
+        JSON.stringify({ command_text: "Get-Location" }),
+        [fixture.tool],
+      ), fixture.client).toBe(true);
+      expect(validateToolArguments(fixture.name, "{}", [fixture.tool]), fixture.client).toBe(false);
+    }
   });
 
   it("maps an aliased native invocation back without changing PowerShell", () => {
@@ -2435,6 +2565,15 @@ describe("lossless client-tool transport", () => {
     expect(tail).toContain("把 BK 全面重构为 Apple 风格");
     expect(tail).toContain(summary);
     expect(tail).not.toContain("secret raw output");
+  });
+
+  it("persists an unanswered trailing user request in the compact portable tail", () => {
+    const tail = compactPortableTaskTail([
+      { type: "message", role: "user", content: [{ type: "input_text", text: "部署到 CF4 并完成线上验证" }] },
+    ]);
+    expect(tail).toContain("部署到 CF4 并完成线上验证");
+    expect(tail).toContain("REQUEST PENDING AT COMPACTION");
+    expect(portableTurnLooksComplete(tail.split("\u001eM365_PORTABLE_TURN_V1\u001f").at(-1) ?? "")).toBe(true);
   });
 });
 

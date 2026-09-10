@@ -8,6 +8,7 @@ import {
   r2BucketInfoArgs,
   r2BucketInfoName,
   r2BucketNames,
+  validEncryptionKey,
   verifyDeployment,
 } from "../deploy-cloudflare.mjs";
 
@@ -102,6 +103,12 @@ assert.throws(
   () => assertAuthorizedCloudflareAccount({ accounts: [{ id: "11111111111111111111111111111111" }] }, "22222222222222222222222222222222"),
   /未授权目标 Cloudflare 账号/u,
 );
+const validCompactionKey = Buffer.alloc(32, 0xa5).toString("base64url");
+assert.equal(validEncryptionKey(validCompactionKey), true);
+assert.equal(validEncryptionKey(Buffer.alloc(48, 0xa5).toString("base64url")), false);
+assert.equal(validEncryptionKey(`${validCompactionKey}=`), false);
+assert.equal(validEncryptionKey("A".repeat(32)), false);
+assert.equal(validEncryptionKey(`${validCompactionKey.slice(0, -1)}!`), false);
 
 assert.deepEqual(
   await verifyDeployment("https://example.invalid", {

@@ -2,7 +2,7 @@ import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { RESPONSE_ALIAS_REGISTRY_NAME, type DurableChatHubRequest } from "../src/chat-session";
 import { decryptJSON, encryptJSON } from "../src/crypto";
-import { MAX_RESPONSES_REQUEST_BYTES } from "../src/request-body";
+import { MAX_COMPACTION_REQUEST_BYTES, MAX_RESPONSES_REQUEST_BYTES } from "../src/request-body";
 import type { OAuthTokenSet } from "../src/types";
 
 function cookie(response: Response): string {
@@ -40,6 +40,61 @@ describe("Worker HTTP contract", () => {
     const invalid = await SELF.fetch("https://example.com/api/health", { method: "POST" });
     expect(invalid.status).toBe(405);
     expect(invalid.headers.get("X-M365-Error-Code")).toBe("method_not_allowed");
+  });
+
+  it("rejects cross-origin management mutations and non-JSON bodies", async () => {
+    const crossOrigin = await SELF.fetch("https://example.com/api/admin/login", {
+      method: "POST",
+      headers: { Origin: "https://attacker.example", "Content-Type": "application/json" },
+      body: JSON.stringify({ password: "test-bootstrap-password-2026" }),
+    });
+    expect(crossOrigin.status).toBe(403);
+    expect(crossOrigin.headers.get("X-M365-Error-Code")).toBe("invalid_origin");
+
+    const wrongType = await SELF.fetch("https://example.com/api/admin/login", {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({ password: "test-bootstrap-password-2026" }),
+    });
+    expect(wrongType.status).toBe(415);
+    expect(wrongType.headers.get("X-M365-Error-Code")).toBe("unsupported_media_type");
+
+    const callbackGet = await SELF.fetch("https://example.com/api/auth/callback?code=secret&state=secret");
+    expect(callbackGet.status).toBe(401);
+    expect(callbackGet.headers.get("X-M365-Error-Code")).toBe("auth_error");
+  });
+
+  it("treats a malformed administrator cookie as unauthenticated", async () => {
+    const response = await SELF.fetch("https://example.com/", {
+      headers: { Cookie: "m365_admin_session=%" },
+      redirect: "manual",
+    });
+    expect(response.status).toBe(307);
+    expect(response.headers.get("Location")).toBe("https://example.com/login");
+  });
+
+  it("keeps a larger bounded recovery budget for Responses compaction", () => {
+    expect(MAX_COMPACTION_REQUEST_BYTES).toBeGreaterThan(MAX_RESPONSES_REQUEST_BYTES);
+    expect(MAX_COMPACTION_REQUEST_BYTES).toBe(16 * 1024 * 1024);
+  });
+
+  it("rejects a blocked login source before accepting another password attempt", async () => {
+    const headers = { "Content-Type": "application/json", "CF-Connecting-IP": "198.51.100.42" };
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const response = await SELF.fetch("https://example.com/api/admin/login", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ password: `wrong-password-${attempt}` }),
+      });
+      expect(response.status).toBe(401);
+    }
+    const blocked = await SELF.fetch("https://example.com/api/admin/login", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ password: "test-bootstrap-password-2026" }),
+    });
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers.get("X-M365-Error-Code")).toBe("rate_limit_error");
   });
 
   it("requires a one-time password change and enforces method contracts", async () => {
@@ -154,7 +209,7 @@ describe("Worker HTTP contract", () => {
       checkpoint: { toolLedgerSnapshot: string; portableProtocolTail: string; callerToolsSnapshot?: string };
     }>(
       firstCompactItem.encrypted_content,
-      env.DATA_ENCRYPTION_KEY,
+      env.COMPACTION_ENCRYPTION_KEY!,
     );
     expect(firstCapsule.version).toBe(3);
     expect(JSON.parse(firstCapsule.checkpoint.toolLedgerSnapshot)).toEqual([
@@ -183,7 +238,7 @@ describe("Worker HTTP contract", () => {
       checkpoint: { toolLedgerSnapshot: string; portableProtocolTail: string; callerToolsSnapshot?: string };
     }>(
       String(restoredBody.output.at(-1)?.encrypted_content ?? ""),
-      env.DATA_ENCRYPTION_KEY,
+      env.COMPACTION_ENCRYPTION_KEY!,
     );
     expect(restoredCapsule.sessionKey).toBe(firstCapsule.sessionKey);
     expect(restoredCapsule.checkpoint.toolLedgerSnapshot).toBe(firstCapsule.checkpoint.toolLedgerSnapshot);
@@ -211,7 +266,7 @@ describe("Worker HTTP contract", () => {
     const upgradedLegacyBody = await upgradedLegacy.json<{ output: Array<{ encrypted_content?: string }> }>();
     const upgradedLegacyCapsule = await decryptJSON<{ version: number; sessionKey: string }>(
       String(upgradedLegacyBody.output.at(-1)?.encrypted_content ?? ""),
-      env.DATA_ENCRYPTION_KEY,
+      env.COMPACTION_ENCRYPTION_KEY!,
     );
     expect(upgradedLegacyCapsule).toMatchObject({ version: 3, sessionKey: firstCapsule.sessionKey });
 
@@ -811,6 +866,9 @@ describe("Durable ChatHub cancellation fence", () => {
     const runId = crypto.randomUUID();
     const gateLeaseId = crypto.randomUUID();
     await session.markUpstreamRun(active.leaseId, active.accountId, gateLeaseId, runId);
+
+    expect(await session.supersedeActive(false)).toBeNull();
+    expect(await session.tryAcquire()).toEqual({ ok: false, code: "CONVERSATION_BUSY" });
 
     const superseded = await session.supersedeActive();
     expect(superseded).not.toBeNull();

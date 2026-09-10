@@ -443,6 +443,33 @@ await stage("responses.context", async () => {
   record("responses.context.8-turn", passed, `marker=${passed ? "preserved" : "missing"}`);
 });
 
+await stage("responses.compaction", async () => {
+  const marker = `RESP-COMPACT-${runId}`;
+  const compact = await jsonRequest("/v1/responses/compact", {
+    model: "gpt-5.6-sol",
+    prompt_cache_key: `${runId}-compact-context`,
+    input: [
+      { role: "user", content: `Preserve this exact deployment marker across compaction: ${marker}` },
+      { role: "assistant", content: `The deployment marker is ${marker}.` },
+    ],
+  });
+  const capsule = Array.isArray(compact.json?.output)
+    ? compact.json.output.find((item) => item?.type === "compaction" && typeof item?.encrypted_content === "string")
+    : null;
+  if (compact.response.status !== 200 || !capsule) throw new Error(`compaction setup failed status=${compact.response.status}`);
+  const resumed = await jsonRequest("/v1/responses", {
+    model: "gpt-5.6-sol",
+    prompt_cache_key: `${runId}-compact-resume`,
+    input: [
+      ...compact.json.output,
+      { role: "user", content: "Return only the exact deployment marker retained before compaction." },
+    ],
+  });
+  const retained = resumed.response.status === 200 && responseText(resumed.json).includes(marker);
+  record("responses.compaction.encrypted-resume", retained,
+    `compact=${compact.response.status};resume=${resumed.response.status};capsule=${Boolean(capsule)};marker=${retained}`);
+});
+
 await stage("responses.tool-ledger", async () => {
   const first = await jsonRequest("/v1/responses", {
     model: "gpt-5.6-sol",
@@ -542,7 +569,7 @@ if (runVisionInput) await stage("vision.input", async () => {
   });
   record("vision.input", result.response.status === 200 && responseText(result.json).trim().length > 0, `status=${result.response.status};chars=${responseText(result.json).length}`);
 });
-else record("vision.input", true, "skipped=true;reason=optional_image_capability_disabled;set_M365_TEST_VISION_INPUT=1_to_probe", { skipped: true });
+else record("vision.input", true, "skipped=true;reason=optional_live_vision_probe_disabled;set_M365_TEST_VISION_INPUT=1_to_probe", { skipped: true });
 
 // Server-side image generation was removed. Even a stale opt-in environment
 // variable must not submit quota-consuming generation requests.
