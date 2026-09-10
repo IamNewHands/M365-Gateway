@@ -25,6 +25,8 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: Deploy with one-click deployer (update mode)
+        env:
+          M365_COMPACTION_ENCRYPTION_KEY: ${{ secrets.M365_COMPACTION_ENCRYPTION_KEY }}
         run: >
           node deploy-cloudflare.mjs
           --update
@@ -33,3 +35,4 @@ jobs:
           --name m365-gateway
           --client-id "${{ secrets.M365_CLIENT_ID }}"
           --kv-id "${{ secrets.M365_KV_ID }}"
+          ${{ secrets.M365_COMPACTION_ENCRYPTION_KEY != '' && '--sync-compaction-key' || '' }}
