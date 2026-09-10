@@ -1,4 +1,5 @@
 import gateway from "./gateway-handler";
+import { runCloudCleanup } from "./cloud-cleanup";
 import type { Env } from "./types";
 
 export { ChatSession } from "./chat-session";
@@ -17,4 +18,8 @@ export default {
     }
     return gateway.fetch(request, env, ctx);
   },
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(runCloudCleanup(env, false));
+  },
 } satisfies ExportedHandler<Env>;
+

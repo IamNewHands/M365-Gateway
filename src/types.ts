@@ -143,3 +143,10 @@ export interface OAuthTokenSet {
   oid: string;
   tid: string;
 }
+
+export interface CloudCleanupSettings {
+  enabled: boolean;
+  maxAgeHours: number;
+  keepN: number;
+}
+
