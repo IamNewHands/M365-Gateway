@@ -186,8 +186,11 @@ describe("ChatHub provider placeholders", () => {
   it("classifies the nominal-success capacity placeholder without matching ordinary prose", () => {
     expect(syntheticUpstreamFailureCode("We're temporarily unable to respond to this volume of requests. Please try again later.")).toBe("CHAT_UPSTREAM_RATE_LIMITED");
     expect(syntheticUpstreamFailureCode("We are temporarily unable to respond to the current volume of requests")).toBe("CHAT_UPSTREAM_RATE_LIMITED");
+    expect(syntheticUpstreamFailureCode("We're currently experiencing high traffic. Please try again later.")).toBe("CHAT_UPSTREAM_RATE_LIMITED");
+    expect(syntheticUpstreamFailureCode("We are currently experiencing high traffic")).toBe("CHAT_UPSTREAM_RATE_LIMITED");
     expect(syntheticUpstreamFailureCode("Explain why a rate limit may affect an API")).toBeNull();
     expect(syntheticUpstreamFailureCode("We're temporarily unable to respond to this volume of requests. Please try again later. Additional context.")).toBeNull();
+    expect(syntheticUpstreamFailureCode("We're currently experiencing high traffic. Please try again later. Additional details.")).toBeNull();
   });
 });
 
