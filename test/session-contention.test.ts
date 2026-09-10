@@ -79,13 +79,13 @@ describe("Responses session contention", () => {
     }
   });
 
-  it("allows one short busy-lease grace retry before latest-request supersession", () => {
+  it("allows one short busy-lease grace retry before returning contention", () => {
     expect([0, 1, 2, 3, 20].map((retry) => conversationLeaseRetryDelay(retry, 15_000)))
       .toEqual([250, 0, 0, 0, 0]);
     expect(conversationLeaseRetryDelay(0, 173)).toBe(173);
   });
 
-  it("returns the atomic replacement lease instead of surfacing a 409", async () => {
+  it("acquires a lease that becomes free during the contention grace", async () => {
     vi.useFakeTimers();
     try {
       let acquireCalls = 0;
@@ -106,14 +106,31 @@ describe("Responses session contention", () => {
       const session = {
         tryAcquire: async () => {
           acquireCalls += 1;
-          return { ok: false, code: "CONVERSATION_BUSY" } as const;
+          return acquireCalls === 1
+            ? { ok: false, code: "CONVERSATION_BUSY" } as const
+            : { ok: true, lease: replacement } as const;
         },
-        supersedeActive: async () => ({ lease: replacement, upstream: null }),
       };
       const pending = acquireConversationLease({} as never, session as never, Date.now() + 10_000);
       await vi.advanceTimersByTimeAsync(250);
       await expect(pending).resolves.toBe(replacement);
       expect(acquireCalls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("surfaces contention without cancelling an active Microsoft invocation", async () => {
+    vi.useFakeTimers();
+    try {
+      const session = {
+        tryAcquire: async () => ({ ok: false, code: "CONVERSATION_BUSY" } as const),
+        supersedeActive: async () => { throw new Error("must not supersede an active request"); },
+      };
+      const pending = acquireConversationLease({} as never, session as never, Date.now() + 10_000);
+      const rejected = expect(pending).rejects.toThrow("CONVERSATION_BUSY");
+      await vi.advanceTimersByTimeAsync(250);
+      await rejected;
     } finally {
       vi.useRealTimers();
     }

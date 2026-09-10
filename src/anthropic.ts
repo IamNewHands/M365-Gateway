@@ -71,6 +71,11 @@ interface ConvertedRequest {
   openAI: Record<string, unknown>;
 }
 
+interface ConvertedTools {
+  tools?: Record<string, unknown>[];
+  hostedNames: string[];
+}
+
 class AnthropicRequestError extends Error {
   constructor(
     readonly status: number,
@@ -271,20 +276,60 @@ function convertMessages(value: unknown, system: unknown): Record<string, unknow
   return result;
 }
 
-function convertTools(value: unknown): Record<string, unknown>[] | undefined {
-  if (value == null) return undefined;
+const ANTHROPIC_HOSTED_TOOL_TYPE = /^(?:web_search|web_fetch)_\d{8}$/u;
+const DELEGATION_TOOL_NAMES = new Set(["agent", "workflow", "spawn_agent", "delegate_task"]);
+
+function systemText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return "";
+  return value.flatMap((block) => isRecord(block) && block.type === "text" && typeof block.text === "string"
+    ? [block.text]
+    : []).join("\n");
+}
+
+function isClaudeSubagent(system: unknown): boolean {
+  return systemText(system).includes("You are a Claude agent, built on Anthropic's Claude Agent SDK.");
+}
+
+function convertTools(value: unknown, suppressDelegation = false): ConvertedTools {
+  if (value == null) return { hostedNames: [] };
   if (!Array.isArray(value) || value.length > 128) invalid("tools must be an array containing at most 128 definitions");
-  return value.map((raw) => {
+  const tools: Record<string, unknown>[] = [];
+  const hostedNames: string[] = [];
+  for (const raw of value) {
     if (!isRecord(raw)) invalid("tool definitions must be objects");
     const name = typeof raw.name === "string" ? raw.name.trim() : "";
+    const type = typeof raw.type === "string" ? raw.type.trim() : "";
+    if (name && ANTHROPIC_HOSTED_TOOL_TYPE.test(type) && raw.input_schema === undefined) {
+      hostedNames.push(name);
+      continue;
+    }
     if (!name || !isRecord(raw.input_schema)) invalid("each tool requires name and input_schema");
+    if (suppressDelegation && DELEGATION_TOOL_NAMES.has(name.toLowerCase())) continue;
     const definition: Record<string, unknown> = {
       name,
       parameters: raw.input_schema,
     };
     if (typeof raw.description === "string") definition.description = raw.description;
-    return { type: "function", function: definition };
-  });
+    tools.push({ type: "function", function: definition });
+  }
+  return { tools: tools.length > 0 ? tools : undefined, hostedNames };
+}
+
+function anthropicSessionKey(metadata: unknown): string | undefined {
+  if (!isRecord(metadata)) return undefined;
+  const direct = [metadata.session_id, metadata.conversation_id, metadata.thread_id]
+    .find((value) => typeof value === "string" && value.trim().length > 0 && value.trim().length <= 1_024);
+  if (typeof direct === "string") return direct.trim();
+  if (typeof metadata.user_id !== "string" || metadata.user_id.length > 16_384) return undefined;
+  try {
+    const value = JSON.parse(metadata.user_id) as unknown;
+    if (!isRecord(value) || typeof value.session_id !== "string") return undefined;
+    const sessionId = value.session_id.trim();
+    return sessionId && sessionId.length <= 1_024 ? sessionId : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function convertToolChoice(value: unknown): unknown {
@@ -348,17 +393,40 @@ export function convertAnthropicBody(parsed: AnthropicBody): ConvertedRequest {
   if (maxTokens < 1) invalid("max_tokens must be a positive integer");
   if (parsed.stream != null && typeof parsed.stream !== "boolean") invalid("stream must be a boolean");
   const reasoningEffort = anthropicReasoningEffort(parsed);
-  const tools = convertTools(parsed.tools);
+  const subagent = isClaudeSubagent(parsed.system);
+  const convertedTools = convertTools(parsed.tools, subagent);
   const toolChoice = convertToolChoice(parsed.tool_choice);
-  if (toolChoice !== undefined && !tools?.length && toolChoice !== "none") invalid("tool_choice requires at least one tool");
+  const selectedHostedTool = isRecord(parsed.tool_choice)
+    && parsed.tool_choice.type === "tool"
+    && typeof parsed.tool_choice.name === "string"
+    && convertedTools.hostedNames.includes(parsed.tool_choice.name.trim());
+  if (toolChoice !== undefined && !convertedTools.tools?.length && toolChoice !== "none"
+    && convertedTools.hostedNames.length === 0) invalid("tool_choice requires at least one tool");
+  const messages = convertMessages(parsed.messages, parsed.system);
+  if (convertedTools.hostedNames.length > 0) {
+    messages.unshift({
+      role: "system",
+      content: "Use Microsoft 365 hosted search and retrieval for the requested web_search/web_fetch capability. Return grounded source URLs in ordinary response text; do not emit a caller-side function call for that hosted capability.",
+    });
+  }
+  if (subagent) {
+    messages.unshift({
+      role: "system",
+      content: "This request is already running inside a delegated Claude task. Complete it directly and do not delegate to another agent or workflow.",
+    });
+  }
   const openAI: Record<string, unknown> = {
     model,
-    messages: convertMessages(parsed.messages, parsed.system),
+    messages,
     stream: parsed.stream === true,
   };
-  if (tools) openAI.tools = tools;
+  if (convertedTools.tools) openAI.tools = convertedTools.tools;
   if (reasoningEffort !== undefined) openAI.reasoning_effort = reasoningEffort;
-  if (toolChoice !== undefined) openAI.tool_choice = toolChoice;
+  if (toolChoice !== undefined) {
+    openAI.tool_choice = selectedHostedTool || !convertedTools.tools?.length ? "none" : toolChoice;
+  }
+  const sessionKey = anthropicSessionKey(parsed.metadata);
+  if (sessionKey) openAI.session_key = sessionKey;
   return { model, maxTokens, stream: parsed.stream === true, openAI };
 }
 
@@ -436,6 +504,7 @@ const stableErrorMessages: Record<string, string> = {
   account_pool_isolated: "all Microsoft 365 accounts require administrator attention",
   session_account_unavailable: "the account bound to this conversation is unavailable",
   conversation_busy: "this conversation already has an active request",
+  request_cancelled: "request was cancelled",
   account_busy: "the Microsoft 365 account is busy; retry later",
   upstream_throttled: "the selected Microsoft 365 account has exhausted its current allowance",
   upstream_rate_limit: "Microsoft ChatHub is temporarily rate-limited; retry later",

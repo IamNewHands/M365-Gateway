@@ -18,13 +18,14 @@ let rl;
 let temporaryDirectory = "";
 
 function parseArgs(values) {
-  const result = { yes: false, update: false, dryRun: false, help: false, syncApiKey: false, resetAdminPassword: false };
+  const result = { yes: false, update: false, dryRun: false, help: false, syncApiKey: false, syncCompactionKey: false, resetAdminPassword: false };
   for (let index = 0; index < values.length; index += 1) {
     const value = values[index];
     if (value === "--yes" || value === "-y") result.yes = true;
     else if (value === "--update") result.update = true;
     else if (value === "--dry-run") result.dryRun = true;
     else if (value === "--sync-api-key") result.syncApiKey = true;
+    else if (value === "--sync-compaction-key") result.syncCompactionKey = true;
     else if (value === "--reset-admin-password") result.resetAdminPassword = true;
     else if (value === "--help" || value === "-h") result.help = true;
     else if (["--name", "--client-id", "--domain", "--kv-id", "--account-id", "--canonical-bundle", "--archive-bucket"].includes(value)) {
@@ -54,6 +55,7 @@ M365 Gateway Cloudflare 一键部署器
   --account-id <32位ID>        明确锁定 Cloudflare 账号，防止 OAuth 与部署目标串号
   --domain <api.example.com>  同时绑定 Cloudflare 自定义域名
   --sync-api-key             从 M365_GATEWAY_API_KEY 安全同步统一客户端 Key
+  --sync-compaction-key      从 M365_COMPACTION_ENCRYPTION_KEY 同步跨 CF 压缩密钥
   --reset-admin-password     从 M365_ADMIN_PASSWORD 安全重置管理员密码（仅更新模式）
   --canonical-bundle <file>  直接部署已核验的线上 Worker 模块，不重新打包
   --archive-bucket <name>    可选：绑定已经创建的 R2 冷归档桶（仅用 info --json 校验，不创建/切换桶）
@@ -122,6 +124,13 @@ function runWrangler(commandArgs, options = {}) {
 
 function randomSecret(bytes = 24) {
   return randomBytes(bytes).toString("base64url");
+}
+
+export function validEncryptionKey(value) {
+  const encoded = String(value ?? "").trim();
+  if (!/^[A-Za-z0-9_-]{43}$/u.test(encoded)) return false;
+  const decoded = Buffer.from(encoded, "base64url");
+  return decoded.length === 32 && decoded.toString("base64url") === encoded;
 }
 
 function parseWranglerJSON(output) {
@@ -523,6 +532,15 @@ async function main() {
     console.log("统一客户端 API Key 已加入临时 Secret 清单；命令输出和项目文件均不写入明文。");
   }
 
+  const sharedCompactionKey = String(process.env.M365_COMPACTION_ENCRYPTION_KEY ?? "").trim();
+  if (!args.dryRun && (!args.update || args.syncCompactionKey)) {
+    if (!validEncryptionKey(sharedCompactionKey)) {
+      throw new Error("新建部署或 --sync-compaction-key 要求 M365_COMPACTION_ENCRYPTION_KEY 为严格 base64url 编码的 32 字节密钥；所有 CF 必须使用同一个值");
+    }
+    secretsForDeploy.COMPACTION_ENCRYPTION_KEY = sharedCompactionKey;
+    console.log("跨 CF 压缩密钥已加入临时 Secret 清单；不会写入命令参数、项目文件或部署日志。");
+  }
+
   if (args.resetAdminPassword) {
     if (!args.update) throw new Error("--reset-admin-password 只能用于更新现有 Worker");
     const adminPassword = String(process.env.M365_ADMIN_PASSWORD ?? "").trim();
@@ -574,6 +592,9 @@ async function main() {
     const secretNames = configuredSecretNames(configPath);
     if (!secretNames.has("DATA_ENCRYPTION_KEY")) {
       throw new Error("现有 Worker 缺少 DATA_ENCRYPTION_KEY；为避免破坏已有 OAuth 密文，已停止更新");
+    }
+    if (!secretNames.has("COMPACTION_ENCRYPTION_KEY") && !secretsForDeploy.COMPACTION_ENCRYPTION_KEY) {
+      throw new Error("现有 Worker 缺少 COMPACTION_ENCRYPTION_KEY；请设置 M365_COMPACTION_ENCRYPTION_KEY 并使用 --sync-compaction-key 后重试");
     }
     if (!secretNames.has("BOOTSTRAP_ADMIN_PASSWORD")) {
       bootstrapPassword = randomSecret(24);

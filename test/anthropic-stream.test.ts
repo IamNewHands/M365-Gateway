@@ -135,6 +135,68 @@ describe("Anthropic streaming compatibility", () => {
     }
   });
 
+  it("keeps a stable Claude Code session from metadata.user_id", () => {
+    const converted = convertAnthropicBody({
+      model: "claude-sonnet",
+      max_tokens: 1024,
+      metadata: { user_id: JSON.stringify({ device_id: "device", session_id: "session-123" }) },
+      messages: [{ role: "user", content: "continue" }],
+    });
+    expect(converted.openAI.session_key).toBe("session-123");
+  });
+
+  it("accepts Anthropic hosted search declarations without treating them as client functions", () => {
+    const converted = convertAnthropicBody({
+      model: "claude-sonnet",
+      max_tokens: 1024,
+      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }],
+      tool_choice: { type: "auto" },
+      messages: [{ role: "user", content: "search the web" }],
+    });
+    expect(converted.openAI.tools).toBeUndefined();
+    expect(converted.openAI.tool_choice).toBe("none");
+    expect(JSON.stringify(converted.openAI.messages)).toContain("Microsoft 365 hosted search");
+  });
+
+  it("does not convert an explicitly selected hosted tool into a missing client function", () => {
+    const schema = { type: "object", properties: {} };
+    const converted = convertAnthropicBody({
+      model: "claude-sonnet",
+      max_tokens: 1024,
+      tools: [
+        { type: "web_search_20250305", name: "web_search" },
+        { name: "Read", input_schema: schema },
+      ],
+      tool_choice: { type: "tool", name: "web_search" },
+      messages: [{ role: "user", content: "search before reading" }],
+    });
+    expect(converted.openAI.tools).toEqual([{
+      type: "function",
+      function: { name: "Read", parameters: schema },
+    }]);
+    expect(converted.openAI.tool_choice).toBe("none");
+  });
+
+  it("prevents a Claude subagent from recursively delegating while retaining direct tools", () => {
+    const schema = { type: "object", properties: {} };
+    const converted = convertAnthropicBody({
+      model: "claude-sonnet",
+      max_tokens: 1024,
+      system: [{ type: "text", text: "You are a Claude agent, built on Anthropic's Claude Agent SDK." }],
+      tools: [
+        { name: "Agent", input_schema: schema },
+        { name: "Workflow", input_schema: schema },
+        { name: "Read", input_schema: schema },
+      ],
+      messages: [{ role: "user", content: "inspect this directly" }],
+    });
+    expect(converted.openAI.tools).toEqual([{
+      type: "function",
+      function: { name: "Read", parameters: schema },
+    }]);
+    expect(JSON.stringify(converted.openAI.messages)).toContain("already running inside a delegated Claude task");
+  });
+
   it("preserves only a bounded gateway internal diagnostic code", async () => {
     const response = await anthropicRequest(request(), env, async () => Response.json({
       error: { code: "upstream_error", message: "private detail" },
@@ -146,6 +208,17 @@ describe("Anthropic streaming compatibility", () => {
     expect(response.headers.get("X-M365-Error-Code")).toBe("upstream_error");
     expect(response.headers.get("X-M365-Internal-Code")).toBe("CHAT_UPSTREAM_ERROR");
     expect(await response.text()).not.toContain("private detail");
+  });
+
+  it("preserves cancellation as a non-502 client-closed response", async () => {
+    const response = await anthropicRequest(request(), env, async () => Response.json({
+      error: { code: "request_cancelled", message: "private detail" },
+    }, { status: 499 }));
+    expect(response.status).toBe(499);
+    expect(response.headers.get("X-M365-Error-Code")).toBe("request_cancelled");
+    await expect(response.json()).resolves.toMatchObject({
+      error: { type: "invalid_request_error", message: "request was cancelled" },
+    });
   });
 
   it("flushes a final SSE frame at EOF and emits one terminal", async () => {

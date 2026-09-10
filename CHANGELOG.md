@@ -1,5 +1,13 @@
 # Changelog
 
+## Local audited repair candidate - 2026-09-09
+
+- Responses compaction now uses a 24k estimated-token public-text budget, preserves an unanswered trailing user request in the encrypted portable tail, and accepts a bounded 16 MiB recovery request.
+- Cross-CF compaction requires a shared `COMPACTION_ENCRYPTION_KEY`; the deployment helper can safely synchronize it from `M365_COMPACTION_ENCRYPTION_KEY`.
+- Admin mutations enforce same-origin browser metadata, JSON endpoints require `application/json`, OAuth callback submission uses POST, and blocked login sources no longer trigger PBKDF2.
+- GPT/Codex catalogs advertise the implemented image-input path while keeping server-side image generation disabled. Real tenant vision acceptance remains an explicit live test.
+- Development dependencies are pinned and `sharp` is overridden to a patched release. This section describes local source only and does not claim deployment.
+
 ## Image upload baseline merged into current source - 2026-09-08
 
 - Restored the user-verified image build's native `FormData` request for Microsoft `UploadFile`; removed the later hand-built chunked multipart body that returned HTTP 417 for real images.
@@ -16,7 +24,7 @@
 
 - Responses/compact 与现有 Chat/Messages 统一采用有界的 8 MiB JSON 请求预算，修复有效 Base64 图片在旧 2 MiB 入口被提前拒绝的问题；不改变模型、密钥、客户端工具或图片内容。
 - 413 大小提示从实际预算生成，保留单图/合计图片限制与分块上传内存保护。
-- 新增超过 3 MiB 的带长度头及分块图片上游传输回归；超 8 MiB 仍拒绝。线上独立 PNG 识图探针位于 scripts/probe-large-image.mjs，记录无密钥的前后对照报告。
+- 新增超过 3 MiB 的带长度头及分块图片上游传输回归；普通推理请求超 8 MiB 仍拒绝。
 
 ## CF2 direct dialogue-to-tool execution mode - 2026-09-01
 

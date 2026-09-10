@@ -8,6 +8,8 @@
  * additionalProperties, arrays/items and primitive numeric/string limits.
  */
 
+import { functionToolDefinition } from "./function-tools";
+
 const MAX_SCHEMA_DEPTH = 64;
 const MAX_VALIDATION_NODES = 50_000;
 
@@ -151,9 +153,8 @@ function validate(value: unknown, schema: unknown, state: ValidationState, depth
 
 function parametersFor(name: string, tools: unknown[]): unknown {
   for (const raw of tools) {
-    if (!isObject(raw)) continue;
-    const fn = isObject(raw.function) ? raw.function : raw;
-    if (fn.name === name) return fn.parameters ?? { type: "object" };
+    const definition = functionToolDefinition(raw);
+    if (definition?.name === name) return definition.parameters ?? { type: "object" };
   }
   return undefined;
 }
@@ -167,4 +168,3 @@ export function validateToolArguments(name: string, encodedArguments: string, to
   if (!isObject(value)) return false;
   return validate(value, schema, { nodes: 0, root: schema }, 0);
 }
-
