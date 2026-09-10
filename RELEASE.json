@@ -1,26 +1,26 @@
 {
-  "release": "2026.09.09-cf4-source",
-  "createdAt": "2026-09-09T02:25:30.867Z",
+  "release": "2026.09.09-cf1-cf4-synchronized",
+  "createdAt": "2026-09-09T22:36:05.250+08:00",
   "sourceKind": "sanitized-maintained-source",
-  "deployedByThisExport": false,
+  "deployedByThisExport": true,
   "productionArtifactEquivalent": true,
   "productionDeployment": {
-    "target": "CF4",
-    "workerVersion": "44bf8859-1fef-40d0-a246-cc60cc013f90",
-    "pulledArtifactSha256": "8251A3AD0AD620C051DC18CA0E8B559C920F557A407637E2B5BB81B6728C7F25",
-    "pulledArtifactBytes": 748828,
-    "note": "This sanitized package was generated from the maintained source used for that deployment; its files are source, not the compiled Worker artifact."
+    "targets": 4,
+    "status": "healthy",
+    "identifiersOmitted": true
   },
   "sourceValidation": {
     "status": "passed",
     "typecheck": "passed",
     "testFiles": 25,
-    "tests": 479,
+    "tests": 494,
     "cloudflareDryRun": "passed"
   },
   "publicPackageValidation": "passed",
   "license": "not-declared-see-LICENSE-NOTICE.md",
-  "imageVisionAcceptance": "not-verified-live-upload-previously-returned-403",
+  "dependencyAudit": "passed-0-known-vulnerabilities",
+  "liveValidation": "passed-on-four-cloudflare-targets-without-gpt6-probes",
+  "imageVisionAcceptance": "passed-on-four-cloudflare-targets",
   "includedCapabilities": {
     "modelCatalog": [
       "gpt-5.5",

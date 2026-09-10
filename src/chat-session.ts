@@ -1246,11 +1246,11 @@ export class ChatSession extends DurableObject<Env> {
     );
   }
 
-  /** Latest request wins after the short contention grace period. The caller
-   * receives a fresh upstream conversation plus the exact displaced runner
-   * identity to cancel. Portable client context and the tool ledger survive,
-   * while a late completion from the displaced lease is rejected by CAS. */
-  async supersedeActive(): Promise<SupersededChatLease | null> {
+  /** Replace an active lease after the short contention grace period. Callers
+   * handling ordinary client retries must pass false: once Microsoft is
+   * running a turn, cancelling it makes retrying SDKs repeatedly displace one
+   * another and turns healthy work into an abort/502 loop. */
+  async supersedeActive(allowRunningUpstream = true): Promise<SupersededChatLease | null> {
     const now = Date.now();
     const storedCallerTools = await this.ctx.storage.get<string>("caller_tools_snapshot");
     const row = this.ctx.storage.sql.exec<{
@@ -1281,6 +1281,12 @@ export class ChatSession extends DurableObject<Env> {
       now,
     ).toArray()[0];
     if (!row) return null;
+    const hasRunningUpstream = Boolean(
+      row.active_upstream_run_id
+      && row.active_upstream_gate_lease_id
+      && row.active_upstream_account_id,
+    );
+    if (hasRunningUpstream && !allowRunningUpstream) return null;
     const portable = boundPortableForPersistedFields({
       conversationId: crypto.randomUUID(),
       sessionId: crypto.randomUUID(),
@@ -1325,9 +1331,7 @@ export class ChatSession extends DurableObject<Env> {
     );
     if (result.rowsWritten !== 1) return null;
     await this.setAlarmAt(this.stateAlarmAt(row, now));
-    const upstream = row.active_upstream_run_id
-      && row.active_upstream_gate_lease_id
-      && row.active_upstream_account_id
+    const upstream = hasRunningUpstream
       ? {
           runId: row.active_upstream_run_id,
           gateLeaseId: row.active_upstream_gate_lease_id,
