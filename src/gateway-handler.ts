@@ -11,6 +11,12 @@ import { readJSONLimited } from "./request-body";
 import { RequestMetricTracker, shouldRetainRequestObservation, trackBufferedResponse, trackStreamingResponse } from "./request-metrics";
 import { MAX_API_KEY_NAME_CHARACTERS, MAX_API_KEY_VALIDITY_DAYS, TenantState } from "./tenant-state";
 import { runCloudCleanup } from "./cloud-cleanup";
+import {
+  deleteCloudConversation,
+  getCloudAccessToken,
+  listCloudConversations,
+  loadCloudConversation,
+} from "./cloud-api";
 import type { Env, RequestMetricInput } from "./types";
 
 
@@ -339,6 +345,67 @@ async function accountRoute(request: Request, env: Env, url: URL): Promise<Respo
         return error(500, "account_credential_error", "the encrypted account credential is unavailable");
       }
       return error(502, "token_refresh_failed", "Microsoft token refresh failed");
+    }
+  }
+  if (url.pathname === "/api/accounts/conversations" && (request.method === "GET" || request.method === "POST")) {
+    let accountId = url.searchParams.get("id") ?? "";
+    if (!accountId && request.method === "POST") {
+      const body = await jsonBody<{ id?: string }>(request);
+      accountId = body.id ?? "";
+    }
+    if (!accountId) return error(400, "missing_account_id", "account id is required");
+    const account = await state.getAuthorizedAccountToken(accountId);
+    if (!account) return error(404, "account_not_found", "account not found or not authorized");
+    try {
+      const clientId = env.M365_CLIENT_ID || "00000000-0000-4000-8000-000000000001";
+      const token = await getCloudAccessToken(clientId, account.tid, account.refreshToken, accountId);
+      const conversations = await listCloudConversations(token);
+      return json({
+        accountId,
+        email: account.email,
+        conversations,
+      });
+    } catch (cause) {
+      const msg = cause instanceof Error ? cause.message : String(cause);
+      return error(502, "cloud_api_failed", `failed to list cloud conversations: ${msg}`);
+    }
+  }
+  if (url.pathname === "/api/accounts/conversations/delete" && request.method === "POST") {
+    const body = await jsonBody<{ id?: string; conversationId?: string }>(request);
+    const accountId = body.id ?? "";
+    const conversationId = body.conversationId ?? "";
+    if (!accountId || !conversationId) {
+      return error(400, "invalid_params", "id and conversationId are required");
+    }
+    const account = await state.getAuthorizedAccountToken(accountId);
+    if (!account) return error(404, "account_not_found", "account not found or not authorized");
+    try {
+      const clientId = env.M365_CLIENT_ID || "00000000-0000-4000-8000-000000000001";
+      const token = await getCloudAccessToken(clientId, account.tid, account.refreshToken, accountId);
+      await deleteCloudConversation(token, conversationId);
+      return json({ status: "deleted", conversationId });
+    } catch (cause) {
+      const msg = cause instanceof Error ? cause.message : String(cause);
+      return error(502, "cloud_api_failed", `failed to delete cloud conversation: ${msg}`);
+    }
+  }
+  if (url.pathname === "/api/accounts/conversations/detail" && request.method === "POST") {
+    const body = await jsonBody<{ id?: string; conversationId?: string }>(request);
+    const accountId = body.id ?? "";
+    const conversationId = body.conversationId ?? "";
+    if (!accountId || !conversationId) {
+      return error(400, "invalid_params", "id and conversationId are required");
+    }
+    const account = await state.getAuthorizedAccountToken(accountId);
+    if (!account) return error(404, "account_not_found", "account not found or not authorized");
+    try {
+      const clientId = env.M365_CLIENT_ID || "00000000-0000-4000-8000-000000000001";
+      const token = await getCloudAccessToken(clientId, account.tid, account.refreshToken, accountId);
+      const detail = await loadCloudConversation(token, conversationId);
+      return json({ status: "ok", conversationId, detail });
+    } catch (cause) {
+      const msg = cause instanceof Error ? cause.message : String(cause);
+      return error(502, "cloud_api_failed", `failed to load cloud conversation: ${msg}`);
     }
   }
   return error(404, "not_found", "account endpoint not found");

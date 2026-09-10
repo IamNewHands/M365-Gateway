@@ -1831,6 +1831,22 @@ export class TenantState extends DurableObject<Env> {
     return results;
   }
 
+  async getAuthorizedAccountToken(id: string): Promise<{ id: string; email: string; oid: string; tid: string; refreshToken: string } | null> {
+    try {
+      const token = await this.readAccountToken(id);
+      if (!token || !token.refreshToken || !token.tid) return null;
+      return {
+        id,
+        email: token.email,
+        oid: token.oid,
+        tid: token.tid,
+        refreshToken: token.refreshToken,
+      };
+    } catch {
+      return null;
+    }
+  }
+
 
   async deleteAccount(id: string): Promise<boolean> {
     const row = this.ctx.storage.sql.exec<{ token_cipher: string; credential_kv_key: string; sequence_no: number }>(

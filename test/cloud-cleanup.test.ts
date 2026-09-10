@@ -129,4 +129,55 @@ describe("cloud conversation cleanup", () => {
     });
     expect(invalid.status).toBe(400);
   });
+
+  it("retrieves authorized account token by id", async () => {
+    const state = await tenant();
+    const id = await addAccount();
+    const token = await state.getAuthorizedAccountToken(id);
+    expect(token).not.toBeNull();
+    expect(token?.id).toBe(id);
+    expect(token?.email).toBe(`${id}@example.test`);
+    expect(token?.refreshToken).toBe(`cleanup-refresh-${id}`);
+
+    const nonexistent = await state.getAuthorizedAccountToken("non-existent-account-id");
+    expect(nonexistent).toBeNull();
+  });
+
+  it("validates conversation management endpoint params", async () => {
+    const login = await SELF.fetch("https://example.com/api/admin/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: "admin-settings-password-1" }),
+    });
+    const cookie = login.headers.get("Set-Cookie") ?? "";
+
+    // Missing id for GET
+    const resNoId = await SELF.fetch("https://example.com/api/accounts/conversations", {
+      headers: { Cookie: cookie },
+    });
+    expect(resNoId.status).toBe(400);
+
+    // Nonexistent account for GET
+    const resNotFound = await SELF.fetch("https://example.com/api/accounts/conversations?id=fake-id", {
+      headers: { Cookie: cookie },
+    });
+    expect(resNotFound.status).toBe(404);
+
+    // Missing params for delete
+    const resDelNoParams = await SELF.fetch("https://example.com/api/accounts/conversations/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ id: "some-id" }),
+    });
+    expect(resDelNoParams.status).toBe(400);
+
+    // Missing params for detail
+    const resDetailNoParams = await SELF.fetch("https://example.com/api/accounts/conversations/detail", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ conversationId: "conv-123" }),
+    });
+    expect(resDetailNoParams.status).toBe(400);
+  });
 });
+
