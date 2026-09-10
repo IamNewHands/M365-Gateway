@@ -142,3 +142,15 @@ export async function deleteCloudConversation(token: string, conversationId: str
     },
   });
 }
+
+export async function loadCloudConversation(token: string, conversationId: string): Promise<Record<string, unknown>> {
+  return doCloudAPI(token, "LoadConversation", {
+    conversationId,
+    state: {
+      conversationPageHistoryList: {
+        chats: [],
+      },
+    },
+  });
+}
+
