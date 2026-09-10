@@ -20,9 +20,12 @@
     "test": "vitest run"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "latest",
-    "typescript": "latest",
-    "vitest": "^4.1.0",
-    "wrangler": "latest"
+    "@cloudflare/vitest-pool-workers": "0.22.0",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11",
+    "wrangler": "4.130.0"
+  },
+  "overrides": {
+    "sharp": "0.35.4"
   }
 }

@@ -26,7 +26,7 @@
 - `SENSITIVE_KV`：保存与 Durable Object 相同的 AES-GCM OAuth 加密密文，作为异地镜像/备份而不是请求热路径。KV 键名是随机不透明值，不含邮箱、OID 或令牌。完整存储边界为“Durable Object 强一致密文权威副本 + AES-GCM KV 镜像”。
 - `ChatSession` Durable Object（SQLite）：每个客户端会话独立保存上游 conversation/session 标识、并发租约和 Responses 待处理工具调用。
 
-`DATA_ENCRYPTION_KEY` 必须作为 Cloudflare Secret 注入。真实密钥、OAuth token、管理员密码和完整 API Key 都不得写入源码、`wrangler.jsonc`、日志或 Git。OAuth 明文只在一次请求的内存中短暂存在；Durable Object 和 KV 持久化的都只有 AES-GCM 密文。
+`DATA_ENCRYPTION_KEY` 和 `COMPACTION_ENCRYPTION_KEY` 必须作为 Cloudflare Secret 注入。前者属于单个部署，后者必须在可能接收同一客户端压缩上下文的 CF 间保持一致。真实密钥、OAuth token、管理员密码和完整 API Key 都不得写入源码、`wrangler.jsonc`、日志或 Git。OAuth 明文只在一次请求的内存中短暂存在；Durable Object 和 KV 持久化的都只有 AES-GCM 密文。
 
 Cloudflare KV 是最终一致存储，因此新建和刷新账号时会先在 `TenantState` 中原子提交密文及版本，再同步 KV 镜像。KV 写入失败会进入持久化指数退避队列，由 `TenantState` 当前唯一的 alarm 处理器重试；账号读取始终使用强一致的 Durable Object 密文，不会因为另一个 PoP 暂时读不到 KV 而误隔离。旧版本的 `kv:` 凭据行会在首次成功读取后原子回填为 Durable Object 密文；旧 KV 暂时不可见只按瞬时故障处理，损坏密文或错误加密密钥才会安全隔离账号。
 
@@ -97,7 +97,7 @@ Codex 的 Responses 续接允许省略重复的固定调用方工具声明（`ex
 
 当前公开模型为：
 
-GPT-6 Astra / Claude Fable 5.1 的官方发布信息、M365 产品范围和待完成的接口验证见 [新模型接入调查](MODEL-RESEARCH.md)。二者尚未接入，不能把官方发布或目录别名视为 ChatHub 已支持。
+模型列表仅以本目录 `src/models.ts` 和真实租户探针为准；不存在于下列目录中的名称不能仅凭上游宣传或客户端别名视为已接入。
 
 - `gpt-5.5`
 - `gpt-5.5-reasoning`
@@ -106,7 +106,7 @@ GPT-6 Astra / Claude Fable 5.1 的官方发布信息、M365 产品范围和待�
 - `claude-sonnet`
 - `claude-sonnet-reasoning`
 
-模型目录只声明已经验证的文本、流式、Responses、工具和推理能力。服务端生图功能已移除：图片生成、编辑和变体接口明确返回不支持，不调用 Microsoft、不选账号、不申请生成任务。`image_generation` 保持 `false`；旧的 `M365_TEST_IMAGE_GENERATION` 开关不再发起探测。图片输入附件、识图路径以及调用方提供的 `view_image` 等本地工具仍保留，但真实视觉能力尚未完成验收，`vision` 仍为 `false`。`scripts/full-functional.mjs` 默认跳过图片输入，仅在明确具备权限并设置 `M365_TEST_VISION_INPUT=1` 时执行视觉探测。音频、Realtime 和语音没有可用实现，不得伪装成可用。
+模型目录声明文本、流式、Responses、工具、推理和图片输入能力。服务端生图功能仍未提供：图片生成、编辑和变体接口明确返回不支持，`image_generation` 保持 `false`。图片附件和调用方 `view_image` 结果会进入受限 UploadFile/ChatHub 路径，`vision` 与 `input_modalities` 允许兼容客户端发送图片；这不等于特定 Microsoft 租户已通过真实识图验收。`scripts/full-functional.mjs` 默认跳过额度相关视觉探针，仅在设置 `M365_TEST_VISION_INPUT=1` 时执行。音频、Realtime 和语音不支持。
 
 `gpt-5.6-sol` 在未指定 reasoning effort 时使用低延迟 Chat 路由；需要更深推理时显式请求 `reasoning_effort=medium/high` 或使用 `gpt-5.6-reasoning`。模型目录只保留已验证的六个稳定路由，不再宣传未完成租户验收的 quick、Terra、旧版 GPT 或 Fable/Opus 候选。Microsoft 偶尔会用 HTTP 200 包装容量占位句，网关会将已识别的占位句转换为可重试的 429，避免把“无工具调用”的假成功交给 Codex/OpenCode。
 
@@ -135,9 +135,9 @@ node scripts/full-functional.mjs
 Remove-Item Env:M365_TEST_API_KEY,Env:M365_TEST_MODELS,Env:M365_TEST_SCOPE -ErrorAction SilentlyContinue
 ```
 
-`M365_TEST_MODELS` 只限制本轮发起请求的模型，不改变 `/v1/models` 的完整公开目录。不要对同一个 Microsoft 365 账号并发运行多份回归脚本；每账号门控会串行上游请求，但大量测试排队仍会造成长延迟并提高上游风控风险。`full-functional.mjs` 和客户端兼容验收默认都是串行执行；四路并发压力段默认关闭，只有在独立候选环境中显式设置 `M365_TEST_CONCURRENCY=1` 才会运行。验证 CF2 时应依次单独运行 Codex、OpenCode、Hermes，上一项完整结束并写出报告后再启动下一项。
+`M365_TEST_MODELS` 只限制本轮发起请求的模型，不改变 `/v1/models` 的完整公开目录。不要对同一个 Microsoft 365 账号并发运行多份回归脚本；每账号门控会串行上游请求，但大量测试排队仍会造成长延迟并提高上游风控风险。`full-functional.mjs` 和客户端兼容验收默认都是串行执行；四路并发压力段默认关闭，只有在独立候选环境中显式设置 `M365_TEST_CONCURRENCY=1` 才会运行。验证 CF2 时应依次单独运行 Codex、OpenCode、Hermes、Claude，上一项完整结束并写出报告后再启动下一项。Reasonix、Pi Agent 和 ZCode 未安装时只运行其已捕获工具 Schema 的协议验收，并在报告中明确标记真实客户端烟测为跳过。
 
-真实客户端验收默认先完成协议、工具调用和续接检查。Codex 的本地写入烟测会在独立临时目录中验证故意损坏的离线状态页；OpenCode 只有在当前工具清单确实具备可控写入能力、并显式设置 `M365_OPENCODE_WRITE_SMOKE=1` 时才运行同类写入烟测。OpenCode 1.18.x 常见清单只有 bash/read/glob，默认跳过该能力不匹配的长循环，并在报告中明确标记 `skipped`，不会把它伪装成通过。客户端之间不共享目录，也不并发运行。
+真实客户端验收默认先完成协议、工具调用和续接检查。覆盖 Codex Responses、OpenCode Chat Completions、Hermes 扁平 Responses、Claude Messages，以及 Reasonix、Pi Agent、ZCode 的捕获 Schema。Codex 的本地写入烟测会在独立临时目录中验证故意损坏的离线状态页；OpenCode 只有在当前工具清单确实具备可控写入能力、并显式设置 `M365_OPENCODE_WRITE_SMOKE=1` 时才运行同类写入烟测。OpenCode 1.18.x 常见清单只有 bash/read/glob，默认跳过该能力不匹配的长循环，并在报告中明确标记 `skipped`，不会把它伪装成通过。客户端之间不共享目录，也不并发运行。
 
 ## 完整安装部署流程
 
@@ -147,9 +147,10 @@ Remove-Item Env:M365_TEST_API_KEY,Env:M365_TEST_MODELS,Env:M365_TEST_SCOPE -Erro
 
 项目根目录提供 `deploy-cloudflare.mjs`。它会自动安装锁定依赖、打开 Cloudflare 官方登录、创建独立 KV，生成 32 字节加密 Secret 和随机初始管理员密码，运行完整检查、生成临时部署配置并发布 Worker。临时配置和 Secret 位于系统临时目录，无论成功失败都会删除，不会写入 Git；随机初始管理员密码只在部署成功后的终端显示一次。
 
-进入项目目录后只需运行：
+进入项目目录后，先从密码管理器把跨 CF 共享密钥放入当前进程，再运行部署器：
 
 ```powershell
+$env:M365_COMPACTION_ENCRYPTION_KEY = "所有-CF-共用的-32字节-base64url-密钥"
 node .\deploy-cloudflare.mjs
 ```
 
@@ -168,10 +169,10 @@ node .\deploy-cloudflare.mjs
 node .\deploy-cloudflare.mjs --yes --account-id "你的-Cloudflare-Account-ID" --name my-m365-gateway --client-id "你的-Entra-Application-ID"
 ```
 
-更新已有 Worker 时必须复用原 KV；脚本不会生成新的 `DATA_ENCRYPTION_KEY`，Cloudflare 会保留现有 Secret：
+更新已有 Worker 时必须复用原 KV；脚本不会生成新的 `DATA_ENCRYPTION_KEY`，Cloudflare 会保留现有 Secret。首次补齐或统一压缩密钥时设置同一个进程变量并增加 `--sync-compaction-key`：
 
 ```powershell
-node .\deploy-cloudflare.mjs --update --account-id "目标-Cloudflare-Account-ID" --name my-m365-gateway --client-id "原-Entra-Application-ID" --kv-id "原-SENSITIVE_KV-ID"
+node .\deploy-cloudflare.mjs --update --sync-compaction-key --account-id "目标-Cloudflare-Account-ID" --name my-m365-gateway --client-id "原-Entra-Application-ID" --kv-id "原-SENSITIVE_KV-ID"
 ```
 
 部署前只验证构建、不登录或创建 Cloudflare 资源：
@@ -257,9 +258,9 @@ npx wrangler kv namespace create SENSITIVE_KV
 - `M365_CLIENT_ID` 是刚才创建的 Entra 应用 ID。
 - `M365_REDIRECT_URI` 与 Entra Authentication 中的 URI 完全一致。
 - `kv_namespaces[0].id` 已填写为本部署刚创建的 KV ID。
-- 没有把 API Key、OAuth token、管理员密码或 `DATA_ENCRYPTION_KEY` 写进文件。
+- 没有把 API Key、OAuth token、管理员密码、`DATA_ENCRYPTION_KEY` 或 `COMPACTION_ENCRYPTION_KEY` 写进持久文件。
 
-生产 `DATA_ENCRYPTION_KEY` 必须是独立的 32 字节 base64url 随机值。首次部署时 Worker 尚不存在，不能依赖先运行 `wrangler secret put`；应把两个 Secret 写进系统临时文件，再让第一次 `wrangler deploy --secrets-file` 原子创建版本：
+生产 `DATA_ENCRYPTION_KEY` 必须是每个部署独立的 32 字节 base64url 随机值；`COMPACTION_ENCRYPTION_KEY` 则必须从密码管理器读取同一个跨 CF 值。首次部署时 Worker 尚不存在，不能依赖先运行 `wrangler secret put`；应把三个 Secret 写进系统临时文件，再让第一次 `wrangler deploy --secrets-file` 原子创建版本：
 
 ```powershell
 $bytes = New-Object byte[] 32
@@ -271,6 +272,7 @@ $bootstrapPassword = [Convert]::ToBase64String($adminBytes).TrimEnd('=').Replace
 $secretFile = Join-Path ([IO.Path]::GetTempPath()) ("m365-gateway-secrets-" + [guid]::NewGuid().ToString('N') + ".json")
 @{
   DATA_ENCRYPTION_KEY = $productionKey
+  COMPACTION_ENCRYPTION_KEY = $env:M365_COMPACTION_ENCRYPTION_KEY
   BOOTSTRAP_ADMIN_PASSWORD = $bootstrapPassword
 } | ConvertTo-Json | Set-Content -LiteralPath $secretFile -Encoding utf8NoBOM
 Write-Host "请立即保存这次生成的初始管理员密码：$bootstrapPassword"
@@ -474,7 +476,7 @@ npx wrangler secret list
 npx wrangler deployments list
 ```
 
-生产环境的长期 Secret 必须包含 `DATA_ENCRYPTION_KEY` 和 `BOOTSTRAP_ADMIN_PASSWORD`；启用固定出口时还需要彼此独立的 `RELAY5_HMAC_SECRET`/`RELAY7_HMAC_SECRET`。`BOOTSTRAP_ADMIN_PASSWORD` 只负责全新状态初始化，管理员改密后不能通过重部署覆盖密码。账号批量迁移端点默认关闭，不能用管理员 Cookie 或普通 `m365_` API Key 调用。只有候选版本带有配置指定的临时版本标签、通过 Version Override 命中该候选、设置 `MIGRATION_ENABLED=true`，并使用独立 `MIGRATION_SIGNING_KEY` 对实际版本 ID、时间戳、nonce、路径和原始请求体签名时才可用。使用版本标签避免在版本上传前无法预知 Cloudflare 版本 UUID 的循环配置问题；请求仍必须同时声明并签名运行时实际版本 UUID。nonce 和 migration ID 都在 Durable Object 中防重放；完成验证后必须删除临时迁移签名 Secret，将迁移开关恢复为 `false`，并在晋升生产前移除临时能力。
+生产环境的长期 Secret 必须包含 `DATA_ENCRYPTION_KEY`、跨 CF 共享的 `COMPACTION_ENCRYPTION_KEY` 和 `BOOTSTRAP_ADMIN_PASSWORD`；启用固定出口时还需要彼此独立的 `RELAY5_HMAC_SECRET`/`RELAY7_HMAC_SECRET`。`BOOTSTRAP_ADMIN_PASSWORD` 只负责全新状态初始化，管理员改密后不能通过重部署覆盖密码。账号批量迁移端点默认关闭，不能用管理员 Cookie 或普通 `m365_` API Key 调用。只有候选版本带有配置指定的临时版本标签、通过 Version Override 命中该候选、设置 `MIGRATION_ENABLED=true`，并使用独立 `MIGRATION_SIGNING_KEY` 对实际版本 ID、时间戳、nonce、路径和原始请求体签名时才可用。使用版本标签避免在版本上传前无法预知 Cloudflare 版本 UUID 的循环配置问题；请求仍必须同时声明并签名运行时实际版本 UUID。nonce 和 migration ID 都在 Durable Object 中防重放；完成验证后必须删除临时迁移签名 Secret，将迁移开关恢复为 `false`，并在晋升生产前移除临时能力。
 
 迁移批次最多 40 个账号，按请求数组顺序写入，`activeSequence` 指定唯一活动账号；其余账号保持路由隔离，只有分类故障触发按序接棒。每个账号保存 `direct`、`relay5` 或 `relay7` 的出口策略标识，OAuthTokenSet 仍先经 AES-256-GCM 加密，再原子写入 Durable Object SQLite 并进入加密 KV 镜像队列。Cloudflare 不能直接拨号服务器版 SOCKS 出口，因此 `relay5`/`relay7` 使用本包 `optional-egress-relay/` 的固定目标 WebSocket 协议：分别配置 `RELAY5_URL`/`RELAY7_URL`、独立 HMAC Secret 和精确的 `RELAY_ORIGIN`。访问令牌只进入 TLS 请求头并被摘要与签名绑定，不出现在 relay URL；配置缺失或非法时会明确失败，绝不会静默降级为 Cloudflare 直连。迁移请求和响应都不得写入日志或保存为仓库文件。
 

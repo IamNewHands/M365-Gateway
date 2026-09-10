@@ -39,7 +39,13 @@ function cookie(request: Request, name: string): string {
   const raw = request.headers.get("Cookie") ?? "";
   for (const item of raw.split(";")) {
     const [key, ...parts] = item.trim().split("=");
-    if (key === name) return decodeURIComponent(parts.join("="));
+    if (key === name) {
+      try {
+        return decodeURIComponent(parts.join("="));
+      } catch {
+        return "";
+      }
+    }
   }
   return "";
 }
@@ -96,7 +102,21 @@ async function managementPage(request: Request, env: Env, url: URL): Promise<Res
 }
 
 async function jsonBody<T>(request: Request): Promise<T> {
+  if (!(request.headers.get("Content-Type") ?? "").toLowerCase().startsWith("application/json")) {
+    throw new Error("JSON_CONTENT_TYPE_REQUIRED");
+  }
   return readJSONLimited<T>(request, MAX_JSON_BYTES);
+}
+
+function mutationOriginError(request: Request, url: URL): Response | null {
+  if (["GET", "HEAD", "OPTIONS"].includes(request.method)) return null;
+  const origin = request.headers.get("Origin");
+  if (origin && origin !== url.origin) return error(403, "invalid_origin", "management request origin is not allowed");
+  const fetchSite = request.headers.get("Sec-Fetch-Site")?.toLowerCase();
+  if (fetchSite && !["same-origin", "none"].includes(fetchSite)) {
+    return error(403, "invalid_origin", "management request must originate from this gateway");
+  }
+  return null;
 }
 
 async function admin(request: Request, env: Env, allowMustChange = false): Promise<{ ok: true } | { ok: false; response: Response }> {
@@ -112,7 +132,9 @@ async function adminRoute(request: Request, env: Env, url: URL): Promise<Respons
   const state = tenant(env);
   if (url.pathname === "/api/admin/login" && request.method === "POST") {
     const body = await jsonBody<{ password?: string }>(request);
-    const result = await state.login(body.password ?? "", request.headers.get("CF-Connecting-IP") ?? "unknown");
+    const password = typeof body.password === "string" ? body.password : "";
+    if (password.length > 128) return error(400, "invalid_admin_password", "administrator password exceeds 128 characters");
+    const result = await state.login(password, request.headers.get("CF-Connecting-IP") ?? "unknown");
     if (!result.ok) {
       if (result.error === "LOGIN_RATE_LIMITED") return error(429, "rate_limit_error", "too many failed login attempts");
       return error(401, "auth_error", "invalid administrator password");
@@ -297,10 +319,11 @@ async function oauthRoute(request: Request, env: Env, url: URL): Promise<Respons
     const pending = await state.createOAuthState();
     return json({ state: pending.state, url: authorizationURL(env, pending.state, pending.challenge), mode: "paste_callback" });
   }
-  if (url.pathname === "/api/auth/callback" && request.method === "GET") {
-    let code = url.searchParams.get("code") ?? "";
-    let oauthState = url.searchParams.get("state") ?? "";
-    const pasted = url.searchParams.get("url");
+  if (url.pathname === "/api/auth/callback" && request.method === "POST") {
+    const body = await jsonBody<{ code?: unknown; state?: unknown; url?: unknown }>(request);
+    let code = typeof body.code === "string" ? body.code : "";
+    let oauthState = typeof body.state === "string" ? body.state : "";
+    const pasted = typeof body.url === "string" ? body.url : "";
     if (pasted) {
       try {
         const callback = new URL(pasted);
@@ -322,6 +345,7 @@ async function oauthRoute(request: Request, env: Env, url: URL): Promise<Respons
       return error(400, "oauth_failed", "Microsoft authorization could not be completed");
     }
   }
+  if (url.pathname === "/api/auth/callback") return error(405, "method_not_allowed", "POST is required for the OAuth callback");
   return error(404, "not_found", "OAuth endpoint not found");
 }
 
@@ -352,7 +376,7 @@ async function migrationRoute(request: Request, env: Env): Promise<Response> {
     // Keep candidate diagnostics actionable without ever echoing token/body data.
     // The stable prefix makes the failure visible to the migration client while
     // avoiding a generic upstream 500 that cannot be investigated remotely.
-    if (code) return error(500, "migration_internal_error", code.slice(0, 120));
+    if (code) return error(500, "migration_internal_error", "account migration failed internally");
     throw cause;
   }
 }
@@ -502,9 +526,13 @@ export default {
           })
         : error(405, "method_not_allowed", "GET is required for /api/health");
       else if (url.pathname === ACCOUNT_MIGRATION_PATH) response = await migrationRoute(request, env);
-      else if (url.pathname.startsWith("/api/admin/")) response = await adminRoute(request, env, url);
-      else if (url.pathname.startsWith("/api/accounts")) response = await accountRoute(request, env, url);
-      else if (url.pathname.startsWith("/api/auth/")) response = await oauthRoute(request, env, url);
+      else if (url.pathname.startsWith("/api/admin/") || url.pathname.startsWith("/api/accounts") || url.pathname.startsWith("/api/auth/")) {
+        const originFailure = mutationOriginError(request, url);
+        if (originFailure) response = originFailure;
+        else if (url.pathname.startsWith("/api/admin/")) response = await adminRoute(request, env, url);
+        else if (url.pathname.startsWith("/api/accounts")) response = await accountRoute(request, env, url);
+        else response = await oauthRoute(request, env, url);
+      }
       else if (url.pathname.startsWith("/api/")) response = error(404, "not_found", "API endpoint not found");
       else if (url.pathname.startsWith("/v1/")) response = await openAI(request, env, url, metrics!);
       else if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html" || url.pathname === "/login" || url.pathname === "/login.html")) response = await managementPage(request, env, url);
@@ -516,6 +544,9 @@ export default {
       }
       if (cause instanceof SyntaxError || (cause instanceof Error && cause.message === "INVALID_JSON")) {
         return finish(error(400, "invalid_json", "request body is not valid JSON"), true);
+      }
+      if (cause instanceof Error && cause.message === "JSON_CONTENT_TYPE_REQUIRED") {
+        return finish(error(415, "unsupported_media_type", "application/json content type is required"), true);
       }
       // Never log arbitrary exception messages here. Fetch, crypto and OAuth
       // errors may embed URLs, authorization codes or credential material.

@@ -7,6 +7,7 @@ import {
   type NormalizedImageAttachment,
 } from "./multimodal";
 import { validateToolArguments } from "./tool-schema";
+import { functionToolDefinition } from "./function-tools";
 
 const RS = "\u001e";
 // Upgrade via fetch() uses HTTPS. Cloudflare turns the successful 101
@@ -516,15 +517,10 @@ export function decodeAZHEXArguments(value: unknown): unknown | null {
 function clientToolParameterKeys(name: string, tools: unknown[]): Set<string> {
   const keys = new Set(SENSITIVE_CLIENT_TOOL_ARGUMENT_KEYS[name] ?? []);
   for (const raw of tools) {
-    if (!raw || typeof raw !== "object") continue;
-    const tool = raw as {
-      function?: { name?: unknown; parameters?: unknown };
-      name?: unknown;
-      parameters?: unknown;
-    };
-    const fn = tool.function && typeof tool.function === "object" ? tool.function : tool;
-    if (fn.name !== name || !fn.parameters || typeof fn.parameters !== "object" || Array.isArray(fn.parameters)) continue;
-    const properties = (fn.parameters as { properties?: unknown }).properties;
+    const definition = functionToolDefinition(raw);
+    if (definition?.name !== name || !definition.parameters
+      || typeof definition.parameters !== "object" || Array.isArray(definition.parameters)) continue;
+    const properties = (definition.parameters as { properties?: unknown }).properties;
     if (!properties || typeof properties !== "object" || Array.isArray(properties)) continue;
     for (const key of Object.keys(properties as Record<string, unknown>)) keys.add(key);
   }
@@ -579,20 +575,16 @@ interface ClientFunctionDefinition {
 /** Accept both Chat Completions' nested function shape and Responses' flat
  * function shape, while excluding provider-hosted built-in tool types. */
 function clientFunctionDefinition(raw: unknown): ClientFunctionDefinition | null {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const definition = functionToolDefinition(raw);
+  if (!definition) return null;
   const tool = raw as Record<string, unknown>;
-  if (tool.type !== undefined && tool.type !== "function") return null;
-  const candidate = tool.function && typeof tool.function === "object" && !Array.isArray(tool.function)
-    ? tool.function as Record<string, unknown>
-    : tool;
-  if (typeof candidate.name !== "string" || !candidate.name.trim()) return null;
   return {
-    name: candidate.name.trim(),
-    description: typeof candidate.description === "string" ? candidate.description : "",
-    parameters: candidate.parameters && typeof candidate.parameters === "object"
-      ? candidate.parameters
+    name: definition.name,
+    description: definition.description,
+    parameters: definition.parameters && typeof definition.parameters === "object"
+      ? definition.parameters
       : {},
-    preservesCallerRuntimeToolSemantics: candidate.name.trim() === "exec"
+    preservesCallerRuntimeToolSemantics: definition.name === "exec"
       && tool.x_m365_original_responses_tool_type === "custom",
   };
 }
@@ -601,15 +593,27 @@ function clientFunctionDefinitions(tools: unknown[]): ClientFunctionDefinition[]
   return tools.map(clientFunctionDefinition).filter((tool): tool is ClientFunctionDefinition => tool !== null);
 }
 
-// ChatHub's wire envelope is bounded by serialized size, not tool count:
-// fifteen ordinary Claude tools are valid while the default 28-tool manifest
-// carries more than 86 KiB of documentation and is rejected before inference.
-// Select the compatible encoding from measured contract size so small future
-// clients keep the native protocol regardless of how many tools they declare.
-const MAX_NATIVE_CLIENT_PLUGIN_CHARACTERS = 64_000;
+// ChatHub's wire envelope is bounded by serialized size, not tool count. In
+// native mode every definition is represented in both the routing prompt and
+// the plugins array. Estimate that complete duplicated contract, including a
+// small fixed-envelope reserve, rather than comparing only the caller's tools
+// array. Hermes' normal 19-tool manifest is about 56 KiB by itself but expands
+// to roughly 117 KiB on the wire if this duplication is ignored.
+const MAX_NATIVE_CLIENT_TOOL_ENVELOPE_CHARACTERS = 64_000;
+const NATIVE_CLIENT_TOOL_ENVELOPE_RESERVE_CHARACTERS = 2_048;
 
 function clientToolManifestCharacters(tools: unknown[]): number {
   return JSON.stringify(tools).length;
+}
+
+function estimatedNativeClientToolEnvelopeCharacters(tools: unknown[]): number {
+  return clientToolManifestCharacters(tools) * 2
+    + tools.length * 256
+    + NATIVE_CLIENT_TOOL_ENVELOPE_RESERVE_CHARACTERS;
+}
+
+function requiresCompactClientToolEnvelope(tools: unknown[]): boolean {
+  return estimatedNativeClientToolEnvelopeCharacters(tools) > MAX_NATIVE_CLIENT_TOOL_ENVELOPE_CHARACTERS;
 }
 
 function compactHighCardinalityToolSchema(value: unknown, depth = 0): unknown {
@@ -889,7 +893,7 @@ function toolProtocolPrompt(text: string, tools: unknown[] = [], choice: unknown
     : undefined;
   const allFunctions = clientFunctionDefinitions(tools);
   const functions = explicit ? allFunctions.filter((fn) => fn.name === explicit) : allFunctions;
-  const compactManifest = clientToolManifestCharacters(tools) > MAX_NATIVE_CLIENT_PLUGIN_CHARACTERS && !explicit;
+  const compactManifest = requiresCompactClientToolEnvelope(tools) && !explicit;
   const publicNames = functions.map((tool) => tool.name);
   const definitions: string[] = [];
   for (const fn of functions) {
@@ -953,7 +957,7 @@ export function clientPlugins(tools: unknown[] = []): Array<Record<string, unkno
 }
 
 function runtimeClientPlugins(tools: unknown[] = [], choice: unknown): Array<Record<string, unknown>> {
-  if (clientToolManifestCharacters(tools) <= MAX_NATIVE_CLIENT_PLUGIN_CHARACTERS) return clientPlugins(tools);
+  if (!requiresCompactClientToolEnvelope(tools)) return clientPlugins(tools);
   const explicit = typeof choice === "object" && choice && !Array.isArray(choice)
     ? ((choice as { function?: { name?: string }; name?: string }).function?.name
       ?? (choice as { name?: string }).name)
