@@ -175,14 +175,7 @@ describe("cloud conversation cleanup", () => {
       body: JSON.stringify({ id: "some-id" }),
     });
     expect(resDelNoParams.status).toBe(400);
-
-    // Missing params for detail
-    const resDetailNoParams = await SELF.fetch("https://example.com/api/accounts/conversations/detail", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Cookie: cookie },
-      body: JSON.stringify({ conversationId: "conv-123" }),
-    });
-    expect(resDetailNoParams.status).toBe(400);
   });
 });
+
 

@@ -15,7 +15,6 @@ import {
   deleteCloudConversation,
   getCloudAccessToken,
   listCloudConversations,
-  loadCloudConversation,
 } from "./cloud-api";
 import type { Env, RequestMetricInput } from "./types";
 
@@ -387,25 +386,6 @@ async function accountRoute(request: Request, env: Env, url: URL): Promise<Respo
     } catch (cause) {
       const msg = cause instanceof Error ? cause.message : String(cause);
       return error(502, "cloud_api_failed", `failed to delete cloud conversation: ${msg}`);
-    }
-  }
-  if (url.pathname === "/api/accounts/conversations/detail" && request.method === "POST") {
-    const body = await jsonBody<{ id?: string; conversationId?: string }>(request);
-    const accountId = body.id ?? "";
-    const conversationId = body.conversationId ?? "";
-    if (!accountId || !conversationId) {
-      return error(400, "invalid_params", "id and conversationId are required");
-    }
-    const account = await state.getAuthorizedAccountToken(accountId);
-    if (!account) return error(404, "account_not_found", "account not found or not authorized");
-    try {
-      const clientId = env.M365_CLIENT_ID || "00000000-0000-4000-8000-000000000001";
-      const token = await getCloudAccessToken(clientId, account.tid, account.refreshToken, accountId);
-      const detail = await loadCloudConversation(token, conversationId);
-      return json({ status: "ok", conversationId, detail });
-    } catch (cause) {
-      const msg = cause instanceof Error ? cause.message : String(cause);
-      return error(502, "cloud_api_failed", `failed to load cloud conversation: ${msg}`);
     }
   }
   return error(404, "not_found", "account endpoint not found");
