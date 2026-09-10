@@ -10,6 +10,7 @@ import {
 import { readJSONLimited } from "./request-body";
 import { RequestMetricTracker, shouldRetainRequestObservation, trackBufferedResponse, trackStreamingResponse } from "./request-metrics";
 import { MAX_API_KEY_NAME_CHARACTERS, MAX_API_KEY_VALIDITY_DAYS, TenantState } from "./tenant-state";
+import { runCloudCleanup } from "./cloud-cleanup";
 import type { Env, RequestMetricInput } from "./types";
 
 
@@ -225,17 +226,62 @@ async function adminRoute(request: Request, env: Env, url: URL): Promise<Respons
       adminSessionTTL: "24 hours",
       chatSessionTTL: "30 days",
       accountSpread: await tenant(env).isAccountSpreadEnabled(),
+      cloudCleanup: await tenant(env).getCloudCleanupSettings(),
       capabilities: CAPABILITY_MATRIX,
     } });
     if (request.method === "POST") {
-      const body = await jsonBody<{ accountSpread?: unknown }>(request);
-      if (body.accountSpread === undefined) return error(501, "not_implemented", "runtime settings editing is not available in the preview build");
-      if (typeof body.accountSpread !== "boolean") {
-        return error(400, "invalid_account_spread", "accountSpread must be a boolean");
+      const body = await jsonBody<{
+        accountSpread?: unknown;
+        cloudCleanup?: {
+          enabled?: unknown;
+          maxAgeHours?: unknown;
+          keepN?: unknown;
+        };
+      }>(request);
+      const responseObj: Record<string, unknown> = {};
+      if (body.accountSpread !== undefined) {
+        if (typeof body.accountSpread !== "boolean") {
+          return error(400, "invalid_account_spread", "accountSpread must be a boolean");
+        }
+        responseObj.accountSpread = await tenant(env).setAccountSpreadEnabled(body.accountSpread);
       }
-      return json({ accountSpread: await tenant(env).setAccountSpreadEnabled(body.accountSpread) });
+      if (body.cloudCleanup !== undefined) {
+        if (typeof body.cloudCleanup !== "object" || body.cloudCleanup === null) {
+          return error(400, "invalid_cloud_cleanup", "cloudCleanup must be an object");
+        }
+        const update: { enabled?: boolean; maxAgeHours?: number; keepN?: number } = {};
+        if (body.cloudCleanup.enabled !== undefined) {
+          if (typeof body.cloudCleanup.enabled !== "boolean") {
+            return error(400, "invalid_cloud_cleanup", "cloudCleanup.enabled must be a boolean");
+          }
+          update.enabled = body.cloudCleanup.enabled;
+        }
+        if (body.cloudCleanup.maxAgeHours !== undefined) {
+          const hours = Number(body.cloudCleanup.maxAgeHours);
+          if (!Number.isFinite(hours) || hours < 1 || hours > 720) {
+            return error(400, "invalid_cloud_cleanup", "cloudCleanup.maxAgeHours must be between 1 and 720");
+          }
+          update.maxAgeHours = hours;
+        }
+        if (body.cloudCleanup.keepN !== undefined) {
+          const keep = Number(body.cloudCleanup.keepN);
+          if (!Number.isFinite(keep) || keep < 0 || keep > 100) {
+            return error(400, "invalid_cloud_cleanup", "cloudCleanup.keepN must be between 0 and 100");
+          }
+          update.keepN = keep;
+        }
+        responseObj.cloudCleanup = await tenant(env).setCloudCleanupSettings(update);
+      }
+      if (Object.keys(responseObj).length === 0) {
+        return error(501, "not_implemented", "runtime settings editing is not available in the preview build");
+      }
+      return json(responseObj);
     }
     return error(501, "not_implemented", "runtime settings editing is not available in the preview build");
+  }
+  if (url.pathname === "/api/admin/cleanup" && request.method === "POST") {
+    const result = await runCloudCleanup(env, true);
+    return json({ ok: true, ...result });
   }
   if (url.pathname === "/api/admin/debug/logs" && request.method === "GET") {
     const limit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);

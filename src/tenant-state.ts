@@ -5,6 +5,7 @@ import { refreshToken } from "./oauth";
 import type { MigratedAccountInput } from "./migration";
 import type {
   AccountEgress,
+  CloudCleanupSettings,
   DiagnosticInput,
   DiagnosticRecord,
   Env,
@@ -849,6 +850,33 @@ export class TenantState extends DurableObject<Env> {
     this.setMeta("account_spread_enabled", enabled ? "1" : "0");
     this.setMeta("account_spread_cursor", "0");
     return this.spreadEnabled();
+  }
+
+  async getCloudCleanupSettings(): Promise<CloudCleanupSettings> {
+    return {
+      enabled: this.meta("cloud_cleanup_enabled") === "1",
+      maxAgeHours: Math.max(1, Number.parseInt(this.meta("cloud_cleanup_max_age_hours") ?? "2", 10) || 2),
+      keepN: Math.max(0, Number.parseInt(this.meta("cloud_cleanup_keep_n") ?? "5", 10) || 5),
+    };
+  }
+
+  async setCloudCleanupSettings(settings: {
+    enabled?: boolean;
+    maxAgeHours?: number;
+    keepN?: number;
+  }): Promise<CloudCleanupSettings> {
+    if (typeof settings.enabled === "boolean") {
+      this.setMeta("cloud_cleanup_enabled", settings.enabled ? "1" : "0");
+    }
+    if (typeof settings.maxAgeHours === "number" && Number.isFinite(settings.maxAgeHours)) {
+      const hours = Math.max(1, Math.min(720, Math.round(settings.maxAgeHours)));
+      this.setMeta("cloud_cleanup_max_age_hours", String(hours));
+    }
+    if (typeof settings.keepN === "number" && Number.isFinite(settings.keepN)) {
+      const keep = Math.max(0, Math.min(100, Math.round(settings.keepN)));
+      this.setMeta("cloud_cleanup_keep_n", String(keep));
+    }
+    return this.getCloudCleanupSettings();
   }
 
   private spreadCursor(): number {
@@ -1778,6 +1806,31 @@ export class TenantState extends DurableObject<Env> {
     const totals = await this.statsSnapshot();
     return { accounts, totals };
   }
+
+  async listAuthorizedAccountTokens(): Promise<Array<{ id: string; email: string; oid: string; tid: string; refreshToken: string }>> {
+    const rows = this.ctx.storage.sql.exec<{ id: string; email: string }>(
+      "SELECT id, email FROM accounts WHERE expires_at > 0 ORDER BY sequence_no, id",
+    ).toArray();
+    const results: Array<{ id: string; email: string; oid: string; tid: string; refreshToken: string }> = [];
+    for (const row of rows) {
+      try {
+        const token = await this.readAccountToken(row.id);
+        if (token && token.refreshToken && token.tid) {
+          results.push({
+            id: row.id,
+            email: token.email || row.email,
+            oid: token.oid,
+            tid: token.tid,
+            refreshToken: token.refreshToken,
+          });
+        }
+      } catch {
+        // Skip unreadable credentials
+      }
+    }
+    return results;
+  }
+
 
   async deleteAccount(id: string): Promise<boolean> {
     const row = this.ctx.storage.sql.exec<{ token_cipher: string; credential_kv_key: string; sequence_no: number }>(

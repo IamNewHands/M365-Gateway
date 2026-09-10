@@ -405,6 +405,7 @@ export function configFor({ workerName, clientId, kvId, domain, accountId = "", 
     },
     secrets: { required: ["DATA_ENCRYPTION_KEY", "BOOTSTRAP_ADMIN_PASSWORD"] },
     observability: { enabled: true, head_sampling_rate: 1 },
+    triggers: { crons: ["0 */2 * * *"] },
   };
   if (accountId) config.account_id = accountId;
   if (domain) config.routes = [{ pattern: domain, custom_domain: true }];
