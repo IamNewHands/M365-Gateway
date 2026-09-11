@@ -57,6 +57,7 @@ const MAX_COMPLETED_CHAT_RUNS_IN_MEMORY = 2;
 // supplied text columns.
 const PERSISTED_STATE_METADATA_RESERVE_BYTES = 1 * 1_024;
 export const RESPONSE_ALIAS_REGISTRY_NAME = "__m365_internal_response_alias_registry_v1__";
+const CHAT_HUB_RUNNER_PREFIX = "__m365_internal_chathub_runner_v1__:";
 // The lease starts before an account gate can queue for up to two minutes and
 // before a ChatHub exchange can run for up to ten minutes. Keep a safety margin
 // so a legitimate long first turn can never be stolen by a second request.
@@ -631,6 +632,11 @@ export class ChatSession extends DurableObject<Env> {
       this.cancelledChatRuns.delete(oldest);
     }
     return "queued";
+  }
+
+  async isChatHubRunActive(runId: string): Promise<boolean> {
+    if (!/^[0-9a-f-]{36}$/iu.test(runId)) return false;
+    return this.activeChatRuns.has(runId);
   }
 
   private responseAliasRegistry(): DurableObjectStub<ChatSession> {
@@ -1281,11 +1287,20 @@ export class ChatSession extends DurableObject<Env> {
       now,
     ).toArray()[0];
     if (!row) return null;
-    const hasRunningUpstream = Boolean(
+    let hasRunningUpstream = Boolean(
       row.active_upstream_run_id
       && row.active_upstream_gate_lease_id
       && row.active_upstream_account_id,
     );
+    if (hasRunningUpstream && !allowRunningUpstream) {
+      const runner = this.env.CHATS.getByName(`${CHAT_HUB_RUNNER_PREFIX}${row.active_upstream_account_id}`);
+      try {
+        hasRunningUpstream = await runner.isChatHubRunActive(row.active_upstream_run_id);
+      } catch {
+        // Preserve the busy fence when runner state cannot be verified.
+        return null;
+      }
+    }
     if (hasRunningUpstream && !allowRunningUpstream) return null;
     const portable = boundPortableForPersistedFields({
       conversationId: crypto.randomUUID(),

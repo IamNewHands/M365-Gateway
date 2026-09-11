@@ -2411,10 +2411,15 @@ export async function acquireConversationLease(
         // Replacing it in that post-upstream window makes both requests race
         // the same CAS commit and surfaces a false conversation_lease_conflict.
         // Let the owner finish; retrying SDKs receive a bounded 409 instead of
-        // cancelling or corrupting the request they are waiting for.
+        // cancelling or corrupting the request they are waiting for. If the
+        // previous lease is only stale post-upstream state, atomically replace
+        // it without cancelling a Microsoft invocation.
         const finalAttempt = await session.tryAcquire();
         if (finalAttempt.ok) return finalAttempt.lease;
-        throw new Error(finalAttempt.code === "CONVERSATION_BUSY" ? "CONVERSATION_BUSY" : finalAttempt.code);
+        if (finalAttempt.code !== "CONVERSATION_BUSY") throw new Error(finalAttempt.code);
+        const replacement = await session.supersedeActive(false);
+        if (replacement) return replacement.lease;
+        throw new Error("CONVERSATION_BUSY");
       }
       const retryDelay = conversationLeaseRetryDelay(busyRetries, remaining);
       if (retryDelay <= 0) continue;

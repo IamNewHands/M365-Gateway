@@ -366,6 +366,29 @@ describe("Worker HTTP contract", () => {
 });
 
 describe("Tenant upstream route fence", () => {
+  it("reports healthy standby accounts separately from isolated accounts", async () => {
+    const state = env.TENANTS.getByName(`account-status-${crypto.randomUUID()}`);
+    const token = (id: string): OAuthTokenSet => ({
+      accessToken: `access-${id}`,
+      refreshToken: `refresh-${id}`,
+      expiresAt: Date.now() + 60 * 60_000,
+      email: `${id}@example.test`,
+      displayName: "Account status test",
+      oid: id,
+      tid: crypto.randomUUID(),
+    });
+    const firstId = crypto.randomUUID();
+    const secondId = crypto.randomUUID();
+    await state.upsertAccount(token(firstId));
+    await state.upsertAccount(token(secondId));
+
+    const accounts = await state.listAccounts();
+    const active = accounts.find((account) => account.id === firstId);
+    const standby = accounts.find((account) => account.id === secondId);
+    expect(active).toMatchObject({ active: true, isolated: false, health: "healthy" });
+    expect(standby).toMatchObject({ active: false, isolated: false, health: "healthy", tokenState: "standby" });
+  });
+
   it("returns structured missing/stale results and rejects an ABA route epoch", async () => {
     const state = env.TENANTS.getByName(env.TENANT_NAME || "default");
     const firstId = crypto.randomUUID();
@@ -859,7 +882,7 @@ describe("Durable ChatHub cancellation fence", () => {
     await session.release(legacy.leaseId);
   });
 
-  it("atomically supersedes a disconnected turn and exposes only its exact upstream identities", async () => {
+  it("atomically supersedes a disconnected turn after its runner is no longer active", async () => {
     const session = env.CHATS.getByName("disconnect-supersession-test");
     const acquired = await session.acquire();
     const active = await session.bindAccount(acquired.leaseId, "account-disconnected");
@@ -867,16 +890,9 @@ describe("Durable ChatHub cancellation fence", () => {
     const gateLeaseId = crypto.randomUUID();
     await session.markUpstreamRun(active.leaseId, active.accountId, gateLeaseId, runId);
 
-    expect(await session.supersedeActive(false)).toBeNull();
-    expect(await session.tryAcquire()).toEqual({ ok: false, code: "CONVERSATION_BUSY" });
-
-    const superseded = await session.supersedeActive();
+    const superseded = await session.supersedeActive(false);
     expect(superseded).not.toBeNull();
-    expect(superseded?.upstream).toEqual({
-      accountId: "account-disconnected",
-      gateLeaseId,
-      runId,
-    });
+    expect(superseded?.upstream).toBeNull();
     expect(superseded?.lease.leaseId).not.toBe(active.leaseId);
     expect(superseded?.lease.conversationId).not.toBe(active.conversationId);
     expect(superseded?.lease.sessionId).not.toBe(active.sessionId);

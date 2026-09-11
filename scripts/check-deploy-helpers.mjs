@@ -11,6 +11,7 @@ import {
   validEncryptionKey,
   verifyDeployment,
 } from "../deploy-cloudflare.mjs";
+import { readFile } from "node:fs/promises";
 
 const deployments = JSON.stringify([
   {
@@ -171,5 +172,10 @@ await assert.rejects(
   }),
   /版本不匹配/u,
 );
+
+const deploySource = await readFile(new URL("../deploy-cloudflare.mjs", import.meta.url), "utf8");
+assert.match(deploySource, /Wrangler 部署命令返回失败；正在核对生产版本/u);
+assert.match(deploySource, /if \(deployFailure\) throw deployFailure;/u);
+assert.match(deploySource, /继续执行版本一致性和健康检查/u);
 
 console.log("deployment helper checks passed");

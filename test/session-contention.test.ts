@@ -125,12 +125,47 @@ describe("Responses session contention", () => {
     try {
       const session = {
         tryAcquire: async () => ({ ok: false, code: "CONVERSATION_BUSY" } as const),
-        supersedeActive: async () => { throw new Error("must not supersede an active request"); },
+        supersedeActive: async (allowRunningUpstream: boolean) => {
+          expect(allowRunningUpstream).toBe(false);
+          return null;
+        },
       };
       const pending = acquireConversationLease({} as never, session as never, Date.now() + 10_000);
       const rejected = expect(pending).rejects.toThrow("CONVERSATION_BUSY");
       await vi.advanceTimersByTimeAsync(250);
       await rejected;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("takes over stale post-upstream state without cancelling a running invocation", async () => {
+    vi.useFakeTimers();
+    try {
+      const replacement = {
+        leaseId: "replacement-lease",
+        conversationId: "replacement-conversation",
+        sessionId: "replacement-session",
+        accountId: "account-1",
+        accountLocked: true,
+        started: false,
+        pendingCallId: "",
+        pendingToolName: "",
+        pendingToolArguments: "",
+        toolLedgerSnapshot: "[]",
+        taskAnchors: [],
+        portableProtocolTail: "portable context",
+      };
+      const session = {
+        tryAcquire: async () => ({ ok: false, code: "CONVERSATION_BUSY" } as const),
+        supersedeActive: async (allowRunningUpstream: boolean) => {
+          expect(allowRunningUpstream).toBe(false);
+          return { lease: replacement, upstream: null };
+        },
+      };
+      const pending = acquireConversationLease({} as never, session as never, Date.now() + 10_000);
+      await vi.advanceTimersByTimeAsync(250);
+      await expect(pending).resolves.toBe(replacement);
     } finally {
       vi.useRealTimers();
     }
