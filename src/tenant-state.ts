@@ -2066,7 +2066,7 @@ export class TenantState extends DurableObject<Env> {
       sequence: row.sequence_no,
       egress: this.safeEgress(row.egress_type),
       active,
-      isolated: !active,
+      isolated: health === "isolated",
       status: health === "isolated" ? "isolated" : health === "cooldown" ? "cooldown" : row.expires_at > now ? "online" : "expired",
       tokenState,
       refreshScheduledAt: refresh ? new Date(refresh.at).toISOString() : null,

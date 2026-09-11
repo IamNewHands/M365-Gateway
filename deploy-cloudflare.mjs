@@ -622,11 +622,24 @@ async function main() {
   console.log("\n[6/7] 部署 Cloudflare Worker…");
   const deployArgs = ["deploy", "--config", configPath, "--keep-vars", "--message", "one-click Cloudflare deployment"];
   if (Object.keys(secretsForDeploy).length > 0) deployArgs.push("--secrets-file", secretPath);
-  const deployOutput = runWrangler(deployArgs, { capture: true });
+  let deployOutput = "";
+  let deployFailure;
+  try {
+    deployOutput = runWrangler(deployArgs, { capture: true });
+  } catch (error) {
+    deployFailure = error;
+    deployOutput = `${error?.stdout ?? ""}${error?.stderr ?? ""}`;
+    if (!args.update || !previousVersionId) throw error;
+    console.warn("Wrangler 部署命令返回失败；正在核对生产版本，避免把触发器或域名接口的部分失败误判为上传失败。");
+  }
 
   const deployedVersion = deployedVersionId(runWrangler(["deployments", "list", "--config", configPath, "--json"], { capture: true }));
   if (args.update && previousVersionId && deployedVersion === previousVersionId) {
+    if (deployFailure) throw deployFailure;
     throw new Error("部署命令返回成功，但 Cloudflare 生产版本未发生变化；已停止后续成功声明");
+  }
+  if (deployFailure) {
+    console.warn(`Wrangler 命令部分失败，但生产版本已从 ${previousVersionId} 更新为 ${deployedVersion}；继续执行版本一致性和健康检查。`);
   }
   console.log(`Cloudflare 新生产版本：${deployedVersion}`);
 
