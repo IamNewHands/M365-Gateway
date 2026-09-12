@@ -1,5 +1,12 @@
 # Changelog
 
+## Ported fixes from 0912 source snapshot - 2026-09-12
+
+- Imported the legitimate-admin lockout fix from `M365-Gateway-OpenSource-0912`: the administrator password is now verified before the IP lockout check, so a correct password (for example, right after a password change) is never rejected as an indistinguishable brute-force attempt for up to 15 minutes. The lockout still applies to invalid credentials only, and the bounded `login_failures` retention (last 1024 rows) is preserved.
+- Deployment helper now runs `wrangler login --device` so the one-time device authorization flow works for headless/automated accounts instead of popping a browser at the gateway host.
+- The `FormData`/`UploadFile` native upload fix and the `isolated` health mapping were already present in this tree, so they were retained unchanged.
+- Skip-list: `PRODUCTION.md`, the hard-coded production `M365_CLIENT_ID` (`c0ab8ce9-…`) guard, and `COMPACTION_ENCRYPTION_KEY`-related removals from 0912 were **not** ported because this repository is the generic multi-target source (`0000…` placeholder, `identifiersOmitted: true`) and already supports cross-CF compaction.
+
 ## Local audited repair candidate - 2026-09-09
 
 - Responses compaction now uses a 24k estimated-token public-text budget, preserves an unanswered trailing user request in the encrypted portable tail, and accepts a bounded 16 MiB recovery request.

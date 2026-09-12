@@ -457,8 +457,8 @@ async function ensureCloudflareLogin(accountId) {
   console.log("\n[2/7] 检查 Cloudflare 登录…");
   let probe = cloudflareIdentityProbe();
   if (probe.status !== 0) {
-    console.log("尚未登录，将打开 Cloudflare 官方授权页面。");
-    runWrangler(["login"]);
+    console.log("尚未登录，将启动带验证码的 Cloudflare 设备授权流程。");
+    runWrangler(["login", "--device"]);
     probe = cloudflareIdentityProbe();
   }
   if (probe.status !== 0) throw new Error("Cloudflare 登录验证失败");

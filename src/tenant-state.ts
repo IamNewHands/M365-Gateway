@@ -1404,12 +1404,15 @@ export class TenantState extends DurableObject<Env> {
       "SELECT failures,blocked_until FROM login_failures WHERE address = ?",
       address,
     ).toArray()[0];
-    // A blocked source must not keep forcing a 100k-iteration PBKDF2 through
-    // the single tenant Durable Object. The administrator can retry after the
-    // bounded lockout or use a different trusted network.
-    if (failure && failure.blocked_until > now) return { ok: false, error: "LOGIN_RATE_LIMITED" };
+    // Never lock the legitimate administrator out after they have changed the
+    // password.  The old implementation rejected every attempt while the IP
+    // was blocked *before* checking the credential, so a correct password was
+    // indistinguishable from a brute-force attack for up to 15 minutes.
+    // Verify once, then apply the lockout only to invalid credentials.
     const validPassword = await verifyPassword(this.meta("admin_password") ?? "", password);
     if (!validPassword) {
+      // A blocked source still short-circuits the failure accounting below.
+      if (failure && failure.blocked_until > now) return { ok: false, error: "LOGIN_RATE_LIMITED" };
       const failures = (failure?.failures ?? 0) + 1;
       const blockedUntil = failures >= 5 ? now + Math.min(15 * 60_000, 30_000 * 2 ** (failures - 5)) : 0;
       this.ctx.storage.sql.exec(
