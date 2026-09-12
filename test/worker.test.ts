@@ -88,6 +88,14 @@ describe("Worker HTTP contract", () => {
       });
       expect(response.status).toBe(401);
     }
+    // The source is now locked out for continued *invalid* attempts.
+    const stillWrong = await SELF.fetch("https://example.com/api/admin/login", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ password: "still-wrong-password" }),
+    });
+    expect(stillWrong.status).toBe(429);
+    expect(stillWrong.headers.get("X-M365-Error-Code")).toBe("rate_limit_error");
     // The correct password must not be indistinguishable from brute force:
     // verify once, then apply the lockout only to invalid credentials.
     const ok = await SELF.fetch("https://example.com/api/admin/login", {
@@ -96,13 +104,6 @@ describe("Worker HTTP contract", () => {
       body: JSON.stringify({ password: "test-bootstrap-password-2026" }),
     });
     expect(ok.status).toBe(200);
-    const secondWrong = await SELF.fetch("https://example.com/api/admin/login", {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ password: "still-wrong-password" }),
-    });
-    expect(secondWrong.status).toBe(429);
-    expect(secondWrong.headers.get("X-M365-Error-Code")).toBe("rate_limit_error");
   });
 
   it("requires a one-time password change and enforces method contracts", async () => {
